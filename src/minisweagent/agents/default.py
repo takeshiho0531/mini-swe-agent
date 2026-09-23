@@ -65,6 +65,18 @@ class DefaultAgent:
         self._mem_online_trc_flags: list[str] = []
         self._mem_online_trc_tokens_saved: int = 0
 
+        # ── Event log (inert unless MSWEA_EVENT_LOG_DIR is set) ──────────────
+        # Every message gets a stable uid in extra["uid"] when it is added, and
+        # is appended verbatim to <dir>/events.jsonl BEFORE any compression
+        # primitive can touch it. Every compression event (budget-triggered or
+        # online TRC) is appended to <dir>/compression_events.jsonl as a diff
+        # against uids (dropped / replaced / added) plus the ordered uid list
+        # after the event, so the exact context at any step can be replayed.
+        # See scripts/reconstruct_context.py in agentCtx.
+        self._evt_dir  = os.environ.get("MSWEA_EVENT_LOG_DIR", "")
+        self._evt_seq  = 0   # shared ordering counter for messages and compression events
+        self._evt_n_compression = 0
+
     def get_template_vars(self, **kwargs) -> dict:
         return recursive_merge(
             self.config.model_dump(),
@@ -80,8 +92,85 @@ class DefaultAgent:
 
     def add_messages(self, *messages: dict) -> list[dict]:
         self.logger.debug(messages)  # set log level to debug to see
+        for _m in messages:
+            self._evt_tag(_m)
+            self._evt_append("events.jsonl", {
+                "seq":    _m["extra"]["uid_seq"],
+                "uid":    _m["extra"]["uid"],
+                "step":   self.n_calls,
+                "origin": "agent",
+                "message": _m,
+            })
         self.messages.extend(messages)
         return list(messages)
+
+    # ── Event-log helpers ────────────────────────────────────────────────────
+    def _evt_tag(self, msg: dict, prefix: str = "m") -> dict:
+        """Assign a stable uid to a message (idempotent). Always runs, so uids
+        are present in trajectory.json even when the event log is disabled."""
+        extra = msg.get("extra")
+        if not isinstance(extra, dict):
+            extra = {}
+            msg["extra"] = extra
+        if "uid" not in extra:
+            self._evt_seq += 1
+            extra["uid"]     = f"{prefix}{self._evt_seq:05d}"
+            extra["uid_seq"] = self._evt_seq
+            extra["uid_step"] = self.n_calls
+        return msg
+
+    def _evt_append(self, name: str, record: dict) -> None:
+        if not self._evt_dir:
+            return
+        d = Path(self._evt_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / name, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+
+    @staticmethod
+    def _evt_snapshot(messages: list[dict]) -> list[tuple]:
+        """(uid, content) pairs; content compared by identity-free equality."""
+        return [(m.get("extra", {}).get("uid"), m.get("content")) for m in messages]
+
+    def _evt_record_compression(self, kind: str, before: list[tuple], **fields) -> None:
+        """Diff self.messages against a pre-compression snapshot and append one
+        record to compression_events.jsonl. New messages (summaries) are tagged
+        with a 'c' uid and stored with full content in the record."""
+        import memory as _mem_evt
+        for m in self.messages:
+            self._evt_tag(m, prefix="c")
+        after = self._evt_snapshot(self.messages)
+        before_map = dict(before)
+        after_map  = dict(after)
+        before_uids = [u for u, _ in before]
+        after_uids  = [u for u, _ in after]
+        dropped  = [u for u in before_uids if u not in after_map]
+        added    = [{"uid": u, "message": m} for u, m in zip(after_uids, self.messages) if u not in before_map]
+        replaced = []
+        for u in after_uids:
+            if u in before_map and before_map[u] != after_map[u]:
+                replaced.append({
+                    "uid": u,
+                    "tokens_before": _mem_evt.count_tokens([{"content": before_map[u]}]),
+                    "tokens_after":  _mem_evt.count_tokens([{"content": after_map[u]}]),
+                    "new_content":   after_map[u],
+                })
+        self._evt_n_compression += 1
+        self._evt_seq += 1
+        self._evt_append("compression_events.jsonl", {
+            "seq":          self._evt_seq,
+            "event_idx":    self._evt_n_compression,
+            "step":         self.n_calls,        # calls completed so far; fires before call step+1
+            "kind":         kind,
+            **fields,
+            "tokens_before": _mem_evt.count_tokens([{"content": c} for _, c in before]),
+            "tokens_after":  _mem_evt.count_tokens(self.messages),
+            "dropped":      dropped,
+            "replaced":     replaced,
+            "added":        added,
+            "before_uids":  before_uids,
+            "after_uids":   after_uids,
+        })
 
     def handle_uncaught_exception(self, e: Exception) -> list[dict]:
         return self.add_messages(
@@ -218,7 +307,13 @@ class DefaultAgent:
             _orig_tokens  = _mem_otrc.count_tokens([_result_msg])
             _step_cleared = self.n_calls - (_FREEZE_K + 1)
             _new_content  = f"[tool-result cleared — online-trc — {_orig_tokens} tok — step {_step_cleared}]"
+            _evt_before_otrc = self._evt_snapshot(self.messages) if self._evt_dir else None
             self.messages[_result_idx] = {**_result_msg, "content": _new_content}
+            if _evt_before_otrc is not None:
+                self._evt_record_compression(
+                    "online_trc", _evt_before_otrc, primitive=_primitive,
+                    flag_from_step=_step_cleared, target_tokens=None, budget=_budget,
+                )
 
             _tokens_saved_otrc = max(0, _orig_tokens - _mem_otrc.count_tokens([self.messages[_result_idx]]))
             self._mem_online_trc_flags.append({
@@ -239,6 +334,11 @@ class DefaultAgent:
                 # History has grown past the budget — compress it now.
                 # Target: reduce to 50% of current size.
                 _target = max(1, int(_current * _mem.COMPRESSION_RATIO))
+                _evt_before = self._evt_snapshot(self.messages) if self._evt_dir else None
+                _evt_sum_pt0 = self._mem_summarization_prompt_tokens
+                _evt_sum_lat0 = self._mem_summarization_latency_s
+                _trc_fallback = False
+                _evt_picked   = None
                 if _pc_dir:
                     import copy as _pc_copy
                     _pc_pre   = _pc_copy.deepcopy(self.messages)  # full context entering compression
@@ -382,6 +482,7 @@ class DefaultAgent:
                     if not hasattr(self, "_staggered_log"):
                         self._staggered_log = []
                     self._staggered_log.append(_picked)
+                    _evt_picked = _picked
 
                     # Dispatch to the picked underlying primitive.
                     if _picked == "truncation":
@@ -418,6 +519,15 @@ class DefaultAgent:
                 else:  # truncation
                     # Drop oldest messages from messages[2:] until size <= target.
                     self.messages, _saved = _mem.truncate(self.messages, _target)
+
+                if _evt_before is not None:
+                    self._evt_record_compression(
+                        "budget", _evt_before, primitive=_primitive, picked=_evt_picked,
+                        budget=_budget, target_tokens=_target, trc_fallback=bool(_trc_fallback),
+                        tokens_saved_reported=_saved,
+                        summary_prompt_tokens=self._mem_summarization_prompt_tokens - _evt_sum_pt0,
+                        summary_latency_s=self._mem_summarization_latency_s - _evt_sum_lat0,
+                    )
 
                 # Record event metadata for the token log.
                 _after = _mem.count_tokens(self.messages)
