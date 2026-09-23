@@ -288,41 +288,66 @@ class DefaultAgent:
 
         # ── Online TRC hook ──────────────────────────────────────────────────
         # Online TRC: freeze-window clearing.
-        # Protect the last FREEZE_K tool results; unconditionally clear the
-        # oldest result outside the window every step.
-        # FREEZE_K=4: target = messages[-9] (result from step n-5),
-        #             guard  = len(messages) ≥ 10.
+        # Protect the newest FREEZE_K tool results verbatim; every step, clear
+        # the newest tool result *outside* that window (≈ the result from step
+        # n-FREEZE_K-1 when the history is regular).
+        #
+        # The target is selected by ROLE, not by position.  An earlier version
+        # rewrote messages[-9] unconditionally; a FormatError (user message with
+        # no assistant reply), a truncation that drops an odd number of messages,
+        # or a summary insertion all shift message parity, and the fixed offset
+        # then landed on assistant messages or — when len(messages)==10 — on
+        # messages[1], the task statement itself.  Candidates here are user-role
+        # messages in the compressible window (index ≥ N_PROTECTED) that are not
+        # summaries and not already-cleared stubs, so the task statement and
+        # assistant turns can never be selected.
         _FREEZE_K   = 4
-        _result_idx = -(2 * _FREEZE_K + 1)   # -9 for FREEZE_K=4
-        _min_len    = 2 * (_FREEZE_K + 1)     # 10 for FREEZE_K=4
         _OTRC_FAMILY = (
             "online_trc",
             "online_trc_summarize_partial",
             "online_trc_structured_summarize_partial",
         )
-        if _primitive in _OTRC_FAMILY and self.n_calls >= 5 and len(self.messages) >= _min_len:
+        if _primitive in _OTRC_FAMILY:
             import memory as _mem_otrc
 
-            _result_msg   = self.messages[_result_idx]
-            _orig_tokens  = _mem_otrc.count_tokens([_result_msg])
-            _step_cleared = self.n_calls - (_FREEZE_K + 1)
-            _new_content  = f"[tool-result cleared — online-trc — {_orig_tokens} tok — step {_step_cleared}]"
-            _evt_before_otrc = self._evt_snapshot(self.messages) if self._evt_dir else None
-            self.messages[_result_idx] = {**_result_msg, "content": _new_content}
-            if _evt_before_otrc is not None:
-                self._evt_record_compression(
-                    "online_trc", _evt_before_otrc, primitive=_primitive,
-                    flag_from_step=_step_cleared, target_tokens=None, budget=_budget,
-                )
+            _OTRC_STUB       = "[tool-result cleared"
+            _OTRC_SKIP_PREFIX = (_OTRC_STUB, "[TOOL OUTPUT CLEARED", "[CONTEXT SUMMARY", "[COMPRESSED HISTORY")
 
-            _tokens_saved_otrc = max(0, _orig_tokens - _mem_otrc.count_tokens([self.messages[_result_idx]]))
-            self._mem_online_trc_flags.append({
-                "step":           self.n_calls,
-                "flag_from_step": _step_cleared,
-                "tokens_cleared": _tokens_saved_otrc,
-            })
-            self._mem_online_trc_tokens_saved += _tokens_saved_otrc
-            _mem_otrc.write_token_log(self)
+            def _otrc_clearable(msg: dict) -> bool:
+                if msg.get("role") != "user":
+                    return False
+                content = msg.get("content")
+                if not isinstance(content, str):
+                    return False
+                return not content.startswith(_OTRC_SKIP_PREFIX)
+
+            _otrc_candidates = [
+                i for i in range(_mem_otrc.N_PROTECTED, len(self.messages))
+                if _otrc_clearable(self.messages[i])
+            ]
+            if len(_otrc_candidates) > _FREEZE_K:
+                _result_idx   = _otrc_candidates[-(_FREEZE_K + 1)]
+                _result_msg   = self.messages[_result_idx]
+                _orig_tokens  = _mem_otrc.count_tokens([_result_msg])
+                _step_cleared = self.n_calls - (_FREEZE_K + 1)   # approximate label (regular history)
+                _new_content  = f"[tool-result cleared — online-trc — {_orig_tokens} tok — step {_step_cleared}]"
+                _evt_before_otrc = self._evt_snapshot(self.messages) if self._evt_dir else None
+                self.messages[_result_idx] = {**_result_msg, "content": _new_content}
+                if _evt_before_otrc is not None:
+                    self._evt_record_compression(
+                        "online_trc", _evt_before_otrc, primitive=_primitive,
+                        flag_from_step=_step_cleared, target_tokens=None, budget=_budget,
+                        cleared_index=_result_idx,
+                    )
+
+                _tokens_saved_otrc = max(0, _orig_tokens - _mem_otrc.count_tokens([self.messages[_result_idx]]))
+                self._mem_online_trc_flags.append({
+                    "step":           self.n_calls,
+                    "flag_from_step": _step_cleared,
+                    "tokens_cleared": _tokens_saved_otrc,
+                })
+                self._mem_online_trc_tokens_saved += _tokens_saved_otrc
+                _mem_otrc.write_token_log(self)
         # ── End online TRC hook ──────────────────────────────────────────────
 
         if _primitive and _budget > 0:
@@ -430,11 +455,11 @@ class DefaultAgent:
                         self._mem_summarization_prompt_tokens += _pt
                         self._mem_summarization_latency_s     += _sum_lat
                 elif _primitive == "online_trc":
-                    # OTRC+TR: freeze window already cleared messages[-9] above;
+                    # OTRC+TR: freeze window already cleared the oldest-outside-window result above;
                     # truncation fires here as the budget-time fallback.
                     self.messages, _saved = _mem.truncate(self.messages, _target)
                 elif _primitive == "online_trc_summarize_partial":
-                    # OTRC+SU-partial: freeze window cleared messages[-9] above;
+                    # OTRC+SU-partial: freeze window already cleared a result above;
                     # SU-partial fires as the budget-time fallback (head summarized,
                     # budget-fitting tail kept verbatim — preserves OTRC's freeze window).
                     self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_partial(
