@@ -314,7 +314,9 @@ class DefaultAgent:
             _OTRC_SKIP_PREFIX = (_OTRC_STUB, "[TOOL OUTPUT CLEARED", "[CONTEXT SUMMARY", "[COMPRESSED HISTORY")
 
             def _otrc_clearable(msg: dict) -> bool:
-                if msg.get("role") != "user":
+                # Summaries are identified the same way as in the offline TRC
+                # primitives (extra["kind"] tag first, marker prefix for old runs).
+                if msg.get("role") != "user" or _mem_otrc.is_summary_message(msg):
                     return False
                 content = msg.get("content")
                 if not isinstance(content, str):
