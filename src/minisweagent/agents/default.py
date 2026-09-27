@@ -61,6 +61,9 @@ class DefaultAgent:
         self._mem_context_tokens_at_compression: list[int] = []
         self._mem_context_tokens_after_compression: list[int] = []
         self._mem_trc_fallback_events               = 0
+        # one record per compression event that requested a summary (see
+        # memory.pop_summary_outcome): attempts, rejections, fallback to truncate
+        self._mem_summary_outcomes: list[dict] = []
         # online TRC accumulators
         self._mem_online_trc_flags: list[str] = []
         self._mem_online_trc_tokens_saved: int = 0
@@ -366,6 +369,8 @@ class DefaultAgent:
                 _evt_sum_lat0 = self._mem_summarization_latency_s
                 _trc_fallback = False
                 _evt_picked   = None
+                if hasattr(_mem, "pop_summary_outcome"):
+                    _mem.pop_summary_outcome()   # discard anything stale before this event
                 if _pc_dir:
                     import copy as _pc_copy
                     _pc_pre   = _pc_copy.deepcopy(self.messages)  # full context entering compression
@@ -547,6 +552,20 @@ class DefaultAgent:
                     # Drop oldest messages from messages[2:] until size <= target.
                     self.messages, _saved = _mem.truncate(self.messages, _target)
 
+                # Outcome of the summary request made by this event (None when the
+                # primitive did not request one, e.g. TRC stage 1 was sufficient).
+                _sum_outcome = _mem.pop_summary_outcome() if hasattr(_mem, "pop_summary_outcome") else None
+                if _sum_outcome is not None:
+                    self._mem_summary_outcomes.append({
+                        "step":       self.n_calls,
+                        "primitive":  _primitive,
+                        "picked":     _evt_picked,
+                        "attempts":   _sum_outcome.get("attempts"),
+                        "accepted":   _sum_outcome.get("accepted"),
+                        "rejections": _sum_outcome.get("rejections", []),
+                        "fallback":   _sum_outcome.get("fallback"),
+                    })
+
                 if _evt_before is not None:
                     self._evt_record_compression(
                         "budget", _evt_before, primitive=_primitive, picked=_evt_picked,
@@ -554,6 +573,7 @@ class DefaultAgent:
                         tokens_saved_reported=_saved,
                         summary_prompt_tokens=self._mem_summarization_prompt_tokens - _evt_sum_pt0,
                         summary_latency_s=self._mem_summarization_latency_s - _evt_sum_lat0,
+                        summary_outcome=_sum_outcome,
                     )
 
                 # Record event metadata for the token log.
