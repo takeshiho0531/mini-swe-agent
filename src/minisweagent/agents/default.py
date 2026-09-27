@@ -222,6 +222,7 @@ class DefaultAgent:
         ---------------------
         Reads two environment variables before every LLM call:
           MSWEA_PRIMITIVE    : "truncation" | "summarization"
+                               | "summarization_free" | "structured_summarize_free" (no length target)
           MSWEA_TOKEN_BUDGET : int  — fires when estimated prompt tokens exceed this
 
         When the budget is hit, the chosen primitive compresses self.messages down
@@ -390,6 +391,25 @@ class DefaultAgent:
                     # LLM call produces a schema-guided summary (Task / Files Modified /
                     # Files Examined / Execution Anchors / Current State).
                     self.messages, _saved, _pt, _ct, _sum_lat = _mem.structured_summarize(
+                        self.messages, self.model, _target
+                    )
+                    self._mem_prompt_tokens               += _pt
+                    self._mem_completion_tokens           += _ct
+                    self._mem_summarization_prompt_tokens += _pt
+                    self._mem_summarization_latency_s     += _sum_lat
+                elif _primitive == "summarization_free":
+                    # SU-free: same as "summarization" but the summarizer gets no word
+                    # target (depth-invariant); _target only sizes the truncate fallback.
+                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_free(
+                        self.messages, self.model, _target
+                    )
+                    self._mem_prompt_tokens               += _pt
+                    self._mem_completion_tokens           += _ct
+                    self._mem_summarization_prompt_tokens += _pt
+                    self._mem_summarization_latency_s     += _sum_lat
+                elif _primitive == "structured_summarize_free":
+                    # SS-free: schema-guided summary with no word target (depth-invariant).
+                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.structured_summarize_free(
                         self.messages, self.model, _target
                     )
                     self._mem_prompt_tokens               += _pt
