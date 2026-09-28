@@ -63,6 +63,7 @@ class DefaultAgent:
         self._mem_context_tokens_after_compression: list[int] = []
         self._mem_trc_fallback_events               = 0
         self._mem_trc_events: list[dict] = []
+        self._mem_tr_events: list[dict] = []
         # one record per compression event that requested a summary (see
         # memory.pop_summary_outcome): attempts, rejections, fallback to truncate
         self._mem_summary_outcomes: list[dict] = []
@@ -280,10 +281,11 @@ class DefaultAgent:
         # WHAT COMPRESSION DOES:
         #   Both primitives protect messages[0:2] (system + task) — never touched.
         #   They operate only on messages[2:] (the agent's working history).
-        #   target = current_size * COMPRESSION_RATIO (0.5) — compress to 50%.
+        #   Standalone TR targets budget * COMPRESSION_RATIO; TRC targets budget.
+        #   Other policies retain their current_size * COMPRESSION_RATIO target.
         #
-        #   truncation  — drops the oldest messages from the front of messages[2:]
-        #                 until size <= target.  No extra LLM call.
+        #   truncation  — drops oldest complete assistant/result turns until size
+        #                 <= target, preserving the latest turn. No extra LLM call.
         #   summarization — one extra LLM call produces a structured summary of
         #                 messages[2:], which replaces the entire compressible
         #                 window with a single summary message.
@@ -373,12 +375,14 @@ class DefaultAgent:
             _current = _mem.count_tokens(self.messages)
             if _current > _budget:
                 # History has grown past the budget — compress it now.
-                # TRC targets the budget itself; other primitives retain their
-                # configured proportional target.
-                _target = (
-                    _budget if _primitive == "tool_result_clear"
-                    else max(1, int(_current * _mem.COMPRESSION_RATIO))
-                )
+                # Only standalone TR uses a budget-relative proportional target.
+                # Stacked policies and summary fallbacks retain their old targets.
+                if _primitive == "tool_result_clear":
+                    _target = _budget
+                elif _primitive == "truncation":
+                    _target = max(1, int(_budget * _mem.COMPRESSION_RATIO))
+                else:
+                    _target = max(1, int(_current * _mem.COMPRESSION_RATIO))
                 _evt_before = self._evt_snapshot(self.messages) if self._evt_dir else None
                 _evt_sum_pt0 = self._mem_summarization_prompt_tokens
                 _evt_sum_lat0 = self._mem_summarization_latency_s
@@ -587,7 +591,9 @@ class DefaultAgent:
                         raise RuntimeError(f"staggered: unknown picked primitive {_picked}")
 
                     self._staggered_event_idx = _idx + 1
-                else:  # truncation
+                elif _primitive == "truncation":
+                    self.messages, _saved = _mem.truncate_oldest_turns(self.messages, _target)
+                else:  # legacy default for unrecognized primitive names
                     # Drop oldest messages from messages[2:] until size <= target.
                     self.messages, _saved = _mem.truncate(self.messages, _target)
 
@@ -611,6 +617,25 @@ class DefaultAgent:
                         "picked": _evt_picked, **_trc_stats,
                     })
 
+                _after = _mem.count_tokens(self.messages)
+                _tr_stats = None
+                if _primitive == "truncation":
+                    _tr_stats = {
+                        "policy": "budget_ratio_complete_turns_v1",
+                        "step": self.n_calls,
+                        "primitive": _primitive,
+                        "budget_tokens": _budget,
+                        "target_tokens": _target,
+                        "tokens_before": _current,
+                        "tokens_after": _after,
+                        "tokens_saved": _current - _after,
+                        # Independent flags: an event can satisfy more than one.
+                        "target_not_met": _after > _target,
+                        "budget_exceeded": _after > _budget,
+                        "zero_reduction": _after == _current,
+                    }
+                    self._mem_tr_events.append(_tr_stats)
+
                 if _evt_before is not None:
                     self._evt_record_compression(
                         "budget", _evt_before, primitive=_primitive, picked=_evt_picked,
@@ -620,10 +645,10 @@ class DefaultAgent:
                         summary_latency_s=self._mem_summarization_latency_s - _evt_sum_lat0,
                         summary_outcome=_sum_outcome,
                         trc_stats=_trc_stats or None,
+                        **({"tr_stats": _tr_stats} if _tr_stats is not None else {}),
                     )
 
                 # Record event metadata for the token log.
-                _after = _mem.count_tokens(self.messages)
                 if _current > 0:
                     self._mem_compression_ratios.append(_after / _current)
                 self._mem_compression_events += 1
