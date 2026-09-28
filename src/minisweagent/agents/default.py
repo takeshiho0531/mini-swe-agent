@@ -463,16 +463,11 @@ class DefaultAgent:
                 # This lets the policy select its next action without waiting
                 # for freeze-window eligibility (or losing the scheduled event).
                 _online_tokens = _mem_otrc.count_tokens(self.messages)
-                if self._evt_dir:
-                    self._evt_record_compression(
-                        "online_trc", self._evt_snapshot(self.messages),
-                        primitive=_primitive, budget=_budget, target_tokens=None,
-                        cleared_index=None, tokens_saved_reported=0,
-                        adaptive_config=_adaptive_config.to_dict(),
-                    )
+                # No history changed: keep this trigger only in adaptive logs,
+                # so online_trc compression records continue to mean actual clears.
                 _adaptive_events.append({
                     "kind": "online_trc", "tokens_before": _online_tokens,
-                    "tokens_after": _online_tokens,
+                    "tokens_after": _online_tokens, "skipped_reason": "no_eligible_result",
                 })
         # ── End online TRC hook ──────────────────────────────────────────────
 
