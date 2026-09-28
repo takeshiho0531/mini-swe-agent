@@ -61,6 +61,7 @@ class DefaultAgent:
         self._mem_context_tokens_at_compression: list[int] = []
         self._mem_context_tokens_after_compression: list[int] = []
         self._mem_trc_fallback_events               = 0
+        self._mem_trc_events: list[dict] = []
         # one record per compression event that requested a summary (see
         # memory.pop_summary_outcome): attempts, rejections, fallback to truncate
         self._mem_summary_outcomes: list[dict] = []
@@ -225,9 +226,9 @@ class DefaultAgent:
                                | "summarization_free" | "structured_summarize_free" (no length target)
           MSWEA_TOKEN_BUDGET : int  — fires when estimated prompt tokens exceed this
 
-        When the budget is hit, the chosen primitive compresses self.messages down
-        to budget * 0.5 tokens (compression ratio r = 0.5), keeping the system
-        prompt and first user message (task statement) protected.
+        Most primitives target current_tokens * COMPRESSION_RATIO. TRC instead
+        clears all but the latest three tool results, then drops oldest complete
+        turns only if needed to meet the budget. System and task are protected.
 
         Token usage and compression stats are accumulated on self._mem_* and written
         to MSWEA_TOKEN_LOG_PATH (if set) after every call.
@@ -262,10 +263,9 @@ class DefaultAgent:
         # TRIGGER: context window size > budget
         #   We measure the current history size with count_tokens(self.messages)
         #   using tiktoken (cl100k_base, accurate to ~5% across models).
-        #   This is checked BEFORE each LLM call, so compression always happens
-        #   before the model sees an oversized context.
-        #   No reset is needed: after compression the history shrinks below budget,
-        #   so the check naturally won't fire again until the history grows back.
+        #   This is checked BEFORE each LLM call. B is a compression trigger,
+        #   not a hard limit: protected content or a summary may still exceed it.
+        #   No reset is needed; the next call checks the current history again.
         #
         # WHAT COMPRESSION DOES:
         #   Both primitives protect messages[0:2] (system + task) — never touched.
@@ -363,12 +363,17 @@ class DefaultAgent:
             _current = _mem.count_tokens(self.messages)
             if _current > _budget:
                 # History has grown past the budget — compress it now.
-                # Target: reduce to 50% of current size.
-                _target = max(1, int(_current * _mem.COMPRESSION_RATIO))
+                # TRC targets the budget itself; other primitives retain their
+                # configured proportional target.
+                _target = (
+                    _budget if _primitive == "tool_result_clear"
+                    else max(1, int(_current * _mem.COMPRESSION_RATIO))
+                )
                 _evt_before = self._evt_snapshot(self.messages) if self._evt_dir else None
                 _evt_sum_pt0 = self._mem_summarization_prompt_tokens
                 _evt_sum_lat0 = self._mem_summarization_latency_s
                 _trc_fallback = False
+                _trc_stats = {}
                 _evt_picked   = None
                 if hasattr(_mem, "pop_summary_outcome"):
                     _mem.pop_summary_outcome()   # discard anything stale before this event
@@ -435,9 +440,11 @@ class DefaultAgent:
                     self._mem_summarization_prompt_tokens += _pt
                     self._mem_summarization_latency_s     += _sum_lat
                 elif _primitive == "tool_result_clear":
-                    # Stubs out bash output bodies oldest-first; falls back to
-                    # truncate() if clearing alone is insufficient.
-                    self.messages, _saved, _trc_fallback = _mem.tool_result_clear(self.messages, _target)
+                    # Clear ALL results older than the latest three, then drop
+                    # complete oldest turns only until the budget is met.
+                    self.messages, _saved, _trc_fallback = _mem.tool_result_clear(
+                        self.messages, _budget, stats=_trc_stats
+                    )
                     if _trc_fallback:
                         self._mem_trc_fallback_events += 1
                 elif _primitive == "scored_tool_result_clear":
@@ -448,9 +455,10 @@ class DefaultAgent:
                     if _trc_fallback:
                         self._mem_trc_fallback_events += 1
                 elif _primitive == "trc_summarize":
-                    # Stage 1: TRC (clear tool outputs oldest-first, no TR fallback).
+                    # Stage 1: clear every result older than the newest three;
+                    # the summary stage handles any remaining budget overflow.
                     self.messages, _saved, _ = _mem.tool_result_clear(
-                        self.messages, _target, fallback_truncate=False
+                        self.messages, _budget, fallback_truncate=False, stats=_trc_stats
                     )
                     # Stage 2: if still over budget, summarize the remaining history.
                     _after_trc = _mem.count_tokens(self.messages)
@@ -465,9 +473,10 @@ class DefaultAgent:
                         self._mem_summarization_prompt_tokens += _pt
                         self._mem_summarization_latency_s     += _sum_lat
                 elif _primitive == "trc_structured_summarize":
-                    # Stage 1: TRC (clear tool outputs oldest-first, no TR fallback).
+                    # Stage 1: clear every result older than the newest three;
+                    # the summary stage handles any remaining budget overflow.
                     self.messages, _saved, _ = _mem.tool_result_clear(
-                        self.messages, _target, fallback_truncate=False
+                        self.messages, _budget, fallback_truncate=False, stats=_trc_stats
                     )
                     # Stage 2: if still over budget, structured-summarize the remaining history.
                     _after_trc = _mem.count_tokens(self.messages)
@@ -550,7 +559,7 @@ class DefaultAgent:
                     elif _picked == "trc_structured_summarize":
                         # TRC stage (no truncate fallback).
                         self.messages, _saved, _ = _mem.tool_result_clear(
-                            self.messages, _target, fallback_truncate=False
+                            self.messages, _budget, fallback_truncate=False, stats=_trc_stats
                         )
                         # SS fallback if still over budget.
                         _after_trc = _mem.count_tokens(self.messages)
@@ -586,6 +595,12 @@ class DefaultAgent:
                         "fallback":   _sum_outcome.get("fallback"),
                     })
 
+                if _trc_stats:
+                    self._mem_trc_events.append({
+                        "step": self.n_calls, "primitive": _primitive,
+                        "picked": _evt_picked, **_trc_stats,
+                    })
+
                 if _evt_before is not None:
                     self._evt_record_compression(
                         "budget", _evt_before, primitive=_primitive, picked=_evt_picked,
@@ -594,6 +609,7 @@ class DefaultAgent:
                         summary_prompt_tokens=self._mem_summarization_prompt_tokens - _evt_sum_pt0,
                         summary_latency_s=self._mem_summarization_latency_s - _evt_sum_lat0,
                         summary_outcome=_sum_outcome,
+                        trc_stats=_trc_stats or None,
                     )
 
                 # Record event metadata for the token log.
@@ -605,9 +621,14 @@ class DefaultAgent:
                 self._mem_compression_event_steps.append(self.n_calls)
                 self._mem_context_tokens_at_compression.append(_current)
                 self._mem_context_tokens_after_compression.append(_after)
-                # No reset of _mem_prompt_tokens needed: the trigger now checks
-                # current context size directly, which is already small after
-                # compression.  It will not fire again until history grows back.
+                if _primitive == "tool_result_clear" and _after > _budget:
+                    # B is a compression trigger, not a hard context limit.
+                    # Preserve the latest turn and continue, persisting the
+                    # overflow flag before the model call in case it fails.
+                    _mem.write_token_log(self)
+                # No reset of _mem_prompt_tokens needed: the trigger checks
+                # current context size directly. If it still exceeds B, another
+                # compression event can fire before the next model call.
         # ────────────────────────────────────────────────────────────────────
 
         self.n_calls += 1
