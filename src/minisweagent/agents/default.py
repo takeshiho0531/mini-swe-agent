@@ -375,11 +375,12 @@ class DefaultAgent:
             _current = _mem.count_tokens(self.messages)
             if _current > _budget:
                 # History has grown past the budget — compress it now.
-                # Only standalone TR uses a budget-relative proportional target.
-                # Stacked policies and summary fallbacks retain their old targets.
+                # Standalone TR and length-free summary fallbacks share B*r.
+                # Other proportional policies retain their current-size targets.
+                _free_summary = _primitive in ("summarization_free", "structured_summarize_free")
                 if _primitive == "tool_result_clear":
                     _target = _budget
-                elif _primitive == "truncation":
+                elif _primitive == "truncation" or _free_summary:
                     _target = max(1, int(_budget * _mem.COMPRESSION_RATIO))
                 else:
                     _target = max(1, int(_current * _mem.COMPRESSION_RATIO))
@@ -418,7 +419,7 @@ class DefaultAgent:
                     self._mem_summarization_latency_s     += _sum_lat
                 elif _primitive == "summarization_free":
                     # SU-free: same as "summarization" but the summarizer gets no word
-                    # target (depth-invariant); _target only sizes the truncate fallback.
+                    # target (depth-invariant); _target only sizes the complete-turn TR fallback.
                     self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_free(
                         self.messages, self.model, _target
                     )
@@ -619,7 +620,9 @@ class DefaultAgent:
 
                 _after = _mem.count_tokens(self.messages)
                 _tr_stats = None
-                if _primitive == "truncation":
+                if _primitive == "truncation" or (
+                    _free_summary and _sum_outcome is not None and _sum_outcome.get("fallback") == "truncate"
+                ):
                     _tr_stats = {
                         "policy": "budget_ratio_complete_turns_v1",
                         "step": self.n_calls,
