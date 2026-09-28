@@ -33,8 +33,13 @@ class AgentConfig(BaseModel):
 
 
 class DefaultAgent:
-    def __init__(self, model: Model, env: Environment, *, config_class: type = AgentConfig, **kwargs):
-        """See the `AgentConfig` class for permitted keyword arguments."""
+    def __init__(self, model: Model, env: Environment, *, config_class: type = AgentConfig,
+                 memory_policy=None, memory_config=None, **kwargs):
+        """See AgentConfig for kwargs; memory_policy selects settings after triggers.
+
+        memory_config is an optional agentctx CompressionConfig. A policy receives
+        a CompressionEvent and returns the next CompressionConfig or None.
+        """
         self.config = config_class(**kwargs)
         self.messages: list[dict] = []
         self.model = model
@@ -71,6 +76,24 @@ class DefaultAgent:
         self._mem_online_trc_flags: list[str] = []
         self._mem_online_trc_tokens_saved: int = 0
 
+        self._memory_policy = None
+        self._memory_config = None
+        self._memory_selection = None
+        self._memory_online_step = 0
+        self._mem_adaptive_events: list[dict] = []
+        if (memory_policy is not None or memory_config is not None
+                or os.environ.get("MSWEA_ADAPTIVE_POLICY")
+                or os.environ.get("MSWEA_ADAPTIVE_SCHEDULE")
+                or os.environ.get("MSWEA_ADAPTIVE_MANIFEST")):
+            from agentctx.compression.adaptive import resolve_policy
+            self._memory_policy, self._memory_config = resolve_policy(memory_policy, memory_config)
+            if (memory_policy is None and memory_config is None
+                    and os.environ.get("MSWEA_ADAPTIVE_MANIFEST")):
+                from agentctx.compression.selection import load_selection, selection_metadata
+                self._memory_selection = selection_metadata(
+                    load_selection(os.environ["MSWEA_ADAPTIVE_MANIFEST"])
+                )
+
         # ── Event log (inert unless MSWEA_EVENT_LOG_DIR is set) ──────────────
         # Every message gets a stable uid in extra["uid"] when it is added, and
         # is appended verbatim to <dir>/events.jsonl BEFORE any compression
@@ -82,6 +105,57 @@ class DefaultAgent:
         self._evt_dir  = os.environ.get("MSWEA_EVENT_LOG_DIR", "")
         self._evt_seq  = 0   # shared ordering counter for messages and compression events
         self._evt_n_compression = 0
+
+    def _advance_memory_policy(self, config, events):
+        """Notify after an event; selected settings take effect on the next query.
+
+        Notify once after all compression operations in this query. The online
+        interval clock is independent of budget-only fallback operations.
+        """
+        if config is None or not events:
+            return
+        import copy
+        from agentctx.compression.adaptive import CompressionConfig, CompressionEvent
+
+        kinds = tuple(event["kind"] for event in events)
+        kind = "online_trc" if "online_trc" in kinds else "budget"
+        tokens_before, tokens_after = events[0]["tokens_before"], events[-1]["tokens_after"]
+        record = {
+            "events": copy.deepcopy(events),
+            "index": len(self._mem_adaptive_events) + 1,
+            "step": self.n_calls, "kind": kind,
+            "config": config.to_dict(),
+            "tokens_before": tokens_before, "tokens_after": tokens_after,
+            "tokens_saved": tokens_before - tokens_after,
+            "status": "pending",
+        }
+        self._mem_adaptive_events.append(record)
+        if "online_trc" in kinds:
+            self._memory_online_step = self.n_calls
+        self._write_token_log()
+        try:
+            event = CompressionEvent(
+                index=record["index"], step=self.n_calls, kind=kind, config=config,
+                tokens_before=tokens_before, tokens_after=tokens_after,
+                messages=tuple(copy.deepcopy(self.messages)), kinds=kinds,
+            )
+            selected = self._memory_policy(event) if self._memory_policy is not None else None
+            if selected is not None:
+                if not isinstance(selected, CompressionConfig):
+                    raise TypeError("memory_policy must return CompressionConfig or None")
+                from agentctx.compression.adaptive import ONLINE_PRIMITIVES
+                if (selected.primitive in ONLINE_PRIMITIVES
+                        and (config.primitive not in ONLINE_PRIMITIVES
+                             or selected.step_interval != config.step_interval)):
+                    self._memory_online_step = self.n_calls
+                self._memory_config = selected
+            record.update(status="ok", next_config=self._memory_config.to_dict())
+        except Exception as exc:
+            record.update(status="error", error=f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            self._evt_append("adaptive_events.jsonl", record)
+            self._write_token_log()
 
     def get_template_vars(self, **kwargs) -> dict:
         return recursive_merge(
@@ -290,8 +364,14 @@ class DefaultAgent:
         #                 messages[2:], which replaces the entire compressible
         #                 window with a single summary message.
         #
-        _primitive = os.environ.get("MSWEA_PRIMITIVE", "")
-        _budget    = int(os.environ.get("MSWEA_TOKEN_BUDGET", "0") or "0")
+        _adaptive_config = self._memory_config
+        _adaptive_events = []
+        if _adaptive_config is not None:
+            _primitive = _adaptive_config.primitive
+            _budget = _adaptive_config.budget
+        else:
+            _primitive = os.environ.get("MSWEA_PRIMITIVE", "")
+            _budget = int(os.environ.get("MSWEA_TOKEN_BUDGET", "0") or "0")
 
         # ── ProbeCtrl full per-step context logging (additive; inert unless the
         #    MSWEA_FULL_CONTEXT_LOG_DIR env var is set). Captures the exact context
@@ -317,13 +397,16 @@ class DefaultAgent:
         # messages in the compressible window (index ≥ N_PROTECTED) that are not
         # summaries and not already-cleared stubs, so the task statement and
         # assistant turns can never be selected.
-        _FREEZE_K   = 4
+        _FREEZE_K = _adaptive_config.freeze_k if _adaptive_config is not None else 4
         _OTRC_FAMILY = (
             "online_trc",
             "online_trc_summarize_partial",
             "online_trc_structured_summarize_partial",
         )
-        if _primitive in _OTRC_FAMILY:
+        _step_interval = _adaptive_config.step_interval if _adaptive_config is not None else None
+        _online_due = (_step_interval is None
+                       or self.n_calls - self._memory_online_step >= _step_interval)
+        if _primitive in _OTRC_FAMILY and _online_due:
             import memory as _mem_otrc
 
             _OTRC_STUB       = "[tool-result cleared"
@@ -344,6 +427,8 @@ class DefaultAgent:
                 if _otrc_clearable(self.messages[i])
             ]
             if len(_otrc_candidates) > _FREEZE_K:
+                if _adaptive_config is not None:
+                    _online_before = _mem_otrc.count_tokens(self.messages)
                 _result_idx   = _otrc_candidates[-(_FREEZE_K + 1)]
                 _result_msg   = self.messages[_result_idx]
                 _orig_tokens  = _mem_otrc.count_tokens([_result_msg])
@@ -356,6 +441,8 @@ class DefaultAgent:
                         "online_trc", _evt_before_otrc, primitive=_primitive,
                         flag_from_step=_step_cleared, target_tokens=None, budget=_budget,
                         cleared_index=_result_idx,
+                        **({"adaptive_config": _adaptive_config.to_dict()}
+                           if _adaptive_config is not None else {}),
                     )
 
                 _tokens_saved_otrc = max(0, _orig_tokens - _mem_otrc.count_tokens([self.messages[_result_idx]]))
@@ -366,10 +453,32 @@ class DefaultAgent:
                 })
                 self._mem_online_trc_tokens_saved += _tokens_saved_otrc
                 _mem_otrc.write_token_log(self)
+                if _adaptive_config is not None:
+                    _adaptive_events.append({
+                        "kind": "online_trc", "tokens_before": _online_before,
+                        "tokens_after": _mem_otrc.count_tokens(self.messages),
+                    })
+            elif _step_interval is not None:
+                # The scheduled trigger still fires with no eligible result.
+                # This lets the policy select its next action without waiting
+                # for freeze-window eligibility (or losing the scheduled event).
+                _online_tokens = _mem_otrc.count_tokens(self.messages)
+                if self._evt_dir:
+                    self._evt_record_compression(
+                        "online_trc", self._evt_snapshot(self.messages),
+                        primitive=_primitive, budget=_budget, target_tokens=None,
+                        cleared_index=None, tokens_saved_reported=0,
+                        adaptive_config=_adaptive_config.to_dict(),
+                    )
+                _adaptive_events.append({
+                    "kind": "online_trc", "tokens_before": _online_tokens,
+                    "tokens_after": _online_tokens,
+                })
         # ── End online TRC hook ──────────────────────────────────────────────
 
-        if _primitive and _budget > 0:
+        if _primitive and _budget is not None and _budget > 0:
             import memory as _mem   # agentCtx root must be on PYTHONPATH
+            _depth = _adaptive_config.depth if _adaptive_config is not None else _mem.COMPRESSION_RATIO
             # Measure the current context window size (= full history size).
             # This is what the model would receive on the next call.
             _current = _mem.count_tokens(self.messages)
@@ -381,9 +490,9 @@ class DefaultAgent:
                 if _primitive == "tool_result_clear":
                     _target = _budget
                 elif _primitive == "truncation" or _free_summary:
-                    _target = max(1, int(_budget * _mem.COMPRESSION_RATIO))
+                    _target = max(1, int(_budget * _depth))
                 else:
-                    _target = max(1, int(_current * _mem.COMPRESSION_RATIO))
+                    _target = max(1, int(_current * _depth))
                 _evt_before = self._evt_snapshot(self.messages) if self._evt_dir else None
                 _evt_sum_pt0 = self._mem_summarization_prompt_tokens
                 _evt_sum_lat0 = self._mem_summarization_latency_s
@@ -478,7 +587,7 @@ class DefaultAgent:
                     # Stage 2: if still over budget, summarize the remaining history.
                     _after_trc = _mem.count_tokens(self.messages)
                     if _after_trc > _budget:
-                        _target2 = max(1, int(_after_trc * _mem.COMPRESSION_RATIO))
+                        _target2 = max(1, int(_after_trc * _depth))
                         self.messages, _saved2, _pt, _ct, _sum_lat = _mem.summarize(
                             self.messages, self.model, _target2
                         )
@@ -496,7 +605,7 @@ class DefaultAgent:
                     # Stage 2: if still over budget, structured-summarize the remaining history.
                     _after_trc = _mem.count_tokens(self.messages)
                     if _after_trc > _budget:
-                        _target2 = max(1, int(_after_trc * _mem.COMPRESSION_RATIO))
+                        _target2 = max(1, int(_after_trc * _depth))
                         self.messages, _saved2, _pt, _ct, _sum_lat = _mem.structured_summarize(
                             self.messages, self.model, _target2
                         )
@@ -579,7 +688,7 @@ class DefaultAgent:
                         # SS fallback if still over budget.
                         _after_trc = _mem.count_tokens(self.messages)
                         if _after_trc > _budget:
-                            _target2 = max(1, int(_after_trc * _mem.COMPRESSION_RATIO))
+                            _target2 = max(1, int(_after_trc * _depth))
                             self.messages, _saved2, _pt, _ct, _sum_lat = _mem.structured_summarize(
                                 self.messages, self.model, _target2
                             )
@@ -648,6 +757,8 @@ class DefaultAgent:
                         summary_latency_s=self._mem_summarization_latency_s - _evt_sum_lat0,
                         summary_outcome=_sum_outcome,
                         trc_stats=_trc_stats or None,
+                        **({"adaptive_config": _adaptive_config.to_dict()}
+                           if _adaptive_config is not None else {}),
                         **({"tr_stats": _tr_stats} if _tr_stats is not None else {}),
                     )
 
@@ -662,11 +773,16 @@ class DefaultAgent:
                 # Persist EVERY compression before the next model call. The
                 # caller may fail, hang, or be killed before a response arrives.
                 self._write_token_log()
+                if _adaptive_config is not None:
+                    _adaptive_events.append({
+                        "kind": "budget", "tokens_before": _current, "tokens_after": _after,
+                    })
                 # No reset of _mem_prompt_tokens needed: the trigger checks
                 # current context size directly. If it still exceeds B, another
                 # compression event can fire before the next model call.
         # ────────────────────────────────────────────────────────────────────
 
+        self._advance_memory_policy(_adaptive_config, _adaptive_events)
         self.n_calls += 1
         if _pc_dir:
             import copy as _pc_copy2
