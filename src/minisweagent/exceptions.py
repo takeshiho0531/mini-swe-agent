@@ -19,4 +19,12 @@ class UserInterruption(InterruptAgentFlow):
 
 
 class FormatError(InterruptAgentFlow):
-    """Raised when the LM's output is not in the expected format."""
+    """Raised when the LM's output is not in the expected format.
+
+    model_response retains the rejected assistant response and its usage/cost
+    metadata for accounting. It is not added to the conversation as an action.
+    """
+
+    def __init__(self, *messages: dict, model_response: dict | None = None):
+        super().__init__(*messages)
+        self.model_response = model_response

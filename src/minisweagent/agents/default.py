@@ -13,7 +13,7 @@ from jinja2 import StrictUndefined, Template
 from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
-from minisweagent.exceptions import InterruptAgentFlow, LimitsExceeded
+from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded
 from minisweagent.utils.serialize import recursive_merge
 
 
@@ -57,6 +57,7 @@ class DefaultAgent:
         # per-step and per-compression-event detail
         self._mem_step_prompt_tokens: list[int] = []
         self._mem_step_completion_tokens: list[int] = []
+        self._mem_model_call_records: list[dict] = []
         self._mem_compression_event_steps: list[int] = []
         self._mem_context_tokens_at_compression: list[int] = []
         self._mem_context_tokens_after_compression: list[int] = []
@@ -207,10 +208,19 @@ class DefaultAgent:
                 self.handle_uncaught_exception(e)
                 raise
             finally:
-                self.save(self.config.output_path)
+                try:
+                    self.save(self.config.output_path)
+                finally:
+                    self._write_token_log()
             if self.messages[-1].get("role") == "exit":
                 break
         return self.messages[-1].get("extra", {})
+
+    def _write_token_log(self) -> None:
+        """Flush stats even when a model/tool error interrupts the current step."""
+        if os.environ.get("MSWEA_TOKEN_LOG_PATH"):
+            import memory
+            memory.write_token_log(self)
 
     def step(self) -> list[dict]:
         """Query the LM, execute actions."""
@@ -621,11 +631,9 @@ class DefaultAgent:
                 self._mem_compression_event_steps.append(self.n_calls)
                 self._mem_context_tokens_at_compression.append(_current)
                 self._mem_context_tokens_after_compression.append(_after)
-                if _primitive == "tool_result_clear" and _after > _budget:
-                    # B is a compression trigger, not a hard context limit.
-                    # Preserve the latest turn and continue, persisting the
-                    # overflow flag before the model call in case it fails.
-                    _mem.write_token_log(self)
+                # Persist EVERY compression before the next model call. The
+                # caller may fail, hang, or be killed before a response arrives.
+                self._write_token_log()
                 # No reset of _mem_prompt_tokens needed: the trigger checks
                 # current context size directly. If it still exceeds B, another
                 # compression event can fire before the next model call.
@@ -635,17 +643,35 @@ class DefaultAgent:
         if _pc_dir:
             import copy as _pc_copy2
             _pc_sent = _pc_copy2.deepcopy(self.messages)  # exact context sent to the model this step
-        _t0      = time.time()
-        message  = self.model.query(self.messages)
+        _t0 = time.time()
+        _query_error = None
+        try:
+            message = self.model.query(self.messages)
+        except (Exception, KeyboardInterrupt) as exc:
+            # FormatError carries the provider response even though parsing
+            # failed. Transport errors may have no response/usage at all.
+            _query_error = exc
+            message = getattr(exc, "model_response", None) or {}
         _latency = time.time() - _t0
 
         self.cost += message.get("extra", {}).get("cost", 0.0)
-        self.add_messages(message)
+        if _query_error is None:
+            self.add_messages(message)
+        elif isinstance(_query_error, FormatError) and _query_error.messages:
+            # Keep the rejected response (including usage, reasoning and finish
+            # reason) in feedback metadata. API preparation strips extra, so it
+            # does not turn the rejected response into a conversation action.
+            feedback, *rest = _query_error.messages
+            _query_error.messages = ({
+                **feedback,
+                "extra": {**feedback.get("extra", {}), **message.get("extra", {}),
+                          "model_call_step": self.n_calls},
+            }, *rest)
 
         # ── Accumulate token usage and write log ─────────────────────────────
         _extra = message.get("extra", {})
         _resp  = _extra.get("response", {})
-        _usage = _resp.get("usage", {}) if isinstance(_resp, dict) else {}
+        _usage = (_resp.get("usage") or {}) if isinstance(_resp, dict) else {}
         _step_pt = _usage.get("prompt_tokens", 0) or 0
         _step_ct = _usage.get("completion_tokens", 0) or 0
         self._mem_prompt_tokens     += _step_pt
@@ -654,6 +680,19 @@ class DefaultAgent:
         self._mem_call_latencies.append(_latency)
         self._mem_step_prompt_tokens.append(_step_pt)
         self._mem_step_completion_tokens.append(_step_ct)
+        _call_status = (
+            "ok" if _query_error is None
+            else "format_error" if isinstance(_query_error, FormatError) else "error"
+        )
+        # Legacy arrays use zero when no usage is returned. These records make
+        # that absence explicit rather than claiming the failed call was free.
+        self._mem_model_call_records.append({
+            "step": self.n_calls, "status": _call_status,
+            "error_type": type(_query_error).__name__ if _query_error is not None else None,
+            "prompt_tokens": _usage.get("prompt_tokens"),
+            "completion_tokens": _usage.get("completion_tokens"),
+            "latency_s": round(_latency, 3),
+        })
         if _pc_dir:
             import json as _pc_json
             from pathlib import Path as _PcPath
@@ -663,16 +702,18 @@ class DefaultAgent:
                 "compressed_this_step": _pc_fired,
                 "sent_context": _pc_sent,                  # exact context the model saw this step (post-compression)
                 "pre_compression_context": _pc_pre,        # full context before compression (None unless fired)
-                "response_text": message.get("content", ""),  # the action produced from sent_context (P-ACT teacher-forces this)
+                "response_text": message.get("content", ""),  # empty for failures without a response
+                "response_status": _call_status,
             }
             _pcd = _PcPath(_pc_dir)
             _pcd.mkdir(parents=True, exist_ok=True)
             with open(_pcd / "full_context_log.jsonl", "a") as _pcf:
                 _pcf.write(_pc_json.dumps(_pc_rec) + "\n")
-        if _primitive and _budget > 0:
-            _mem.write_token_log(self)
+        self._write_token_log()
         # ────────────────────────────────────────────────────────────────────
 
+        if _query_error is not None:
+            raise _query_error
         return message
 
     def execute_actions(self, message: dict) -> list[dict]:
