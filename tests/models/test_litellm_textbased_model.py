@@ -124,3 +124,78 @@ def test_litellm_model_cost_validation_zero_cost():
 
             assert "Cost must be > 0.0, got 0.0" in str(exc_info.value)
             assert "MSWEA_COST_TRACKING='ignore_errors'" in str(exc_info.value)
+
+
+# ── Unclosed-think fallback ────────────────────────────────────────────────
+
+_ONE_ACTION = "Look at the file.\n\n```mswea_bash_command\nls /testbed\n```"
+
+
+def _response(content, reasoning_content, finish_reason="stop"):
+    message = {"role": "assistant", "content": content}
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
+    return litellm.ModelResponse(
+        choices=[{"finish_reason": finish_reason, "index": 0, "message": message}],
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    )
+
+
+def test_unclosed_think_fallback_takes_action_from_reasoning():
+    model = LitellmTextbasedModel(model_name="gpt-4", cost_tracking="ignore_errors")
+    assert model._parse_actions(_response(None, _ONE_ACTION)) == [{"command": "ls /testbed"}]
+    assert model._parse_actions(_response("  \n", _ONE_ACTION)) == [{"command": "ls /testbed"}]
+
+
+@pytest.mark.parametrize(
+    "content,reasoning,finish_reason",
+    [
+        (None, _ONE_ACTION, "length"),  # cut off by the token limit
+        (None, "just thinking, no command", "stop"),  # zero actions
+        (None, _ONE_ACTION + "\n" + _ONE_ACTION, "stop"),  # several actions
+        (None, None, "stop"),  # nothing at all
+        ("no block here", _ONE_ACTION, "stop"),  # content present but malformed: content wins
+    ],
+)
+def test_unclosed_think_fallback_not_applied(content, reasoning, finish_reason):
+    from minisweagent.exceptions import FormatError
+
+    model = LitellmTextbasedModel(model_name="gpt-4", cost_tracking="ignore_errors")
+    with pytest.raises(FormatError):
+        model._parse_actions(_response(content, reasoning, finish_reason))
+
+
+def test_unclosed_think_fallback_disabled():
+    from minisweagent.exceptions import FormatError
+
+    model = LitellmTextbasedModel(model_name="gpt-4", cost_tracking="ignore_errors", unclosed_think_fallback=False)
+    with pytest.raises(FormatError):
+        model._parse_actions(_response(None, _ONE_ACTION))
+
+
+def test_content_still_preferred_over_reasoning():
+    model = LitellmTextbasedModel(model_name="gpt-4", cost_tracking="ignore_errors")
+    resp = _response("```mswea_bash_command\npwd\n```", "draft:\n```mswea_bash_command\nls\n```")
+    assert model._parse_actions(resp) == [{"command": "pwd"}]
+
+
+def test_query_rewrites_message_on_fallback():
+    model = LitellmTextbasedModel(model_name="gpt-4", cost_tracking="ignore_errors")
+    with patch.object(model, "_query", return_value=_response(None, _ONE_ACTION)):
+        message = model.query([{"role": "user", "content": "go"}])
+    assert message["content"] == _ONE_ACTION
+    assert "reasoning_content" not in message
+    assert message["extra"]["action_source"] == "reasoning_content"
+    assert message["extra"]["actions"] == [{"command": "ls /testbed"}]
+    # the raw response is still on record
+    assert message["extra"]["response"]["choices"][0]["message"]["reasoning_content"] == _ONE_ACTION
+    assert message["extra"]["response"]["choices"][0]["message"]["content"] is None
+
+
+def test_query_leaves_normal_message_alone():
+    model = LitellmTextbasedModel(model_name="gpt-4", cost_tracking="ignore_errors")
+    with patch.object(model, "_query", return_value=_response(_ONE_ACTION, "thinking...")):
+        message = model.query([{"role": "user", "content": "go"}])
+    assert message["content"] == _ONE_ACTION
+    assert message["reasoning_content"] == "thinking..."
+    assert "action_source" not in message["extra"]
