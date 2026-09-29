@@ -714,6 +714,9 @@ class DefaultAgent:
                         "accepted":   _sum_outcome.get("accepted"),
                         "rejections": _sum_outcome.get("rejections", []),
                         "fallback":   _sum_outcome.get("fallback"),
+                        # flags of the accepted (or last rejected) reply:
+                        # markers, finish_reason, raw_chars (audit trail)
+                        "flags":      _sum_outcome.get("flags"),
                     })
 
                 if _trc_stats:
@@ -767,7 +770,13 @@ class DefaultAgent:
                 self._mem_context_tokens_after_compression.append(_after)
                 # Persist EVERY compression before the next model call. The
                 # caller may fail, hang, or be killed before a response arrives.
+                # The trajectory is flushed too: run() only saves it in the
+                # step's finally, which never runs when the harness SIGKILLs
+                # the process on timeout, so trajectory.json used to lag the
+                # event log and token log by one compression in such runs.
                 self._write_token_log()
+                if self.config.output_path:
+                    self.save(self.config.output_path)
                 if _adaptive_config is not None:
                     _adaptive_events.append({
                         "kind": "budget", "tokens_before": _current, "tokens_after": _after,
