@@ -72,6 +72,11 @@ class DefaultAgent:
         # one record per compression event that requested a summary (see
         # memory.pop_summary_outcome): attempts, rejections, fallback to truncate
         self._mem_summary_outcomes: list[dict] = []
+        # {"step", "primitive", "picked"} while a budget compression event is in
+        # progress; None otherwise. A summarizer query that raises escapes the
+        # event before it pops its outcome, so _write_token_log() uses this to
+        # salvage the partial outcome (response ids so far) of the failed event.
+        self._mem_active_compression: dict | None = None
         # online TRC accumulators
         self._mem_online_trc_flags: list[str] = []
         self._mem_online_trc_tokens_saved: int = 0
@@ -295,7 +300,38 @@ class DefaultAgent:
         """Flush stats even when a model/tool error interrupts the current step."""
         if os.environ.get("MSWEA_TOKEN_LOG_PATH"):
             import memory
+            self._salvage_interrupted_summary(memory)
             memory.write_token_log(self)
+
+    def _salvage_interrupted_summary(self, _mem) -> None:
+        """Record the outcome of a compression event that did not complete.
+
+        The event pops its summary outcome right after the primitive returns.
+        When the summarizer query raises (transport error, interrupt), the
+        exception leaves query() before that pop, and run()'s finally lands
+        here. The responses already received still occupied KV blocks, so
+        their ids are kept: the entry gets accepted=False and the exception
+        type in "interrupted". Nothing is recorded when the failed event never
+        requested a summary.
+        """
+        context = self._mem_active_compression
+        if context is None or not hasattr(_mem, "pop_summary_outcome"):
+            return
+        self._mem_active_compression = None
+        outcome = _mem.pop_summary_outcome()
+        if outcome is None:
+            return
+        self._mem_summary_outcomes.append({
+            **context,
+            "attempts":   outcome.get("attempts"),
+            "accepted":   False,
+            "rejections": outcome.get("rejections", []),
+            "fallback":   None,
+            "flags":      outcome.get("flags"),
+            "response_ids": list(outcome.get("response_ids") or []),
+            "interrupted": outcome.get("interrupted") or "unknown",
+            "interrupted_attempt": outcome.get("interrupted_attempt"),
+        })
 
     def step(self) -> list[dict]:
         """Query the LM, execute actions."""
@@ -496,6 +532,9 @@ class DefaultAgent:
                 _evt_picked   = None
                 if hasattr(_mem, "pop_summary_outcome"):
                     _mem.pop_summary_outcome()   # discard anything stale before this event
+                self._mem_active_compression = {
+                    "step": self.n_calls, "primitive": _primitive, "picked": _evt_picked,
+                }
                 if _pc_dir:
                     import copy as _pc_copy
                     _pc_pre   = _pc_copy.deepcopy(self.messages)  # full context entering compression
@@ -705,6 +744,7 @@ class DefaultAgent:
                 # Outcome of the summary request made by this event (None when the
                 # primitive did not request one, e.g. TRC stage 1 was sufficient).
                 _sum_outcome = _mem.pop_summary_outcome() if hasattr(_mem, "pop_summary_outcome") else None
+                self._mem_active_compression = None
                 if _sum_outcome is not None:
                     self._mem_summary_outcomes.append({
                         "step":       self.n_calls,
@@ -717,6 +757,9 @@ class DefaultAgent:
                         # flags of the accepted (or last rejected) reply:
                         # markers, finish_reason, raw_chars (audit trail)
                         "flags":      _sum_outcome.get("flags"),
+                        # provider response id per attempt: joins summarizer
+                        # requests to the server-side KV trace
+                        "response_ids": list(_sum_outcome.get("response_ids") or []),
                     })
 
                 if _trc_stats:
@@ -842,6 +885,8 @@ class DefaultAgent:
             _cache_fields = cache_usage(_usage)
         self._mem_model_call_records.append({
             "step": self.n_calls, "status": _call_status,
+            # Join server-side KV ownership to this agent step.
+            "response_id": _resp.get("id") if isinstance(_resp, dict) else None,
             "error_type": type(_query_error).__name__ if _query_error is not None else None,
             "prompt_tokens": _usage.get("prompt_tokens"),
             "completion_tokens": _usage.get("completion_tokens"),
