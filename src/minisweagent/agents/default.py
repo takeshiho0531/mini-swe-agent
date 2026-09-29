@@ -834,12 +834,19 @@ class DefaultAgent:
         )
         # Legacy arrays use zero when no usage is returned. These records make
         # that absence explicit rather than claiming the failed call was free.
+        try:
+            from agentctx.compression.cache_metrics import cache_usage
+        except ImportError:   # agentCtx not on PYTHONPATH: keep the record, skip cache fields
+            _cache_fields = {"cache_usage_status": "collector_unavailable"}
+        else:
+            _cache_fields = cache_usage(_usage)
         self._mem_model_call_records.append({
             "step": self.n_calls, "status": _call_status,
             "error_type": type(_query_error).__name__ if _query_error is not None else None,
             "prompt_tokens": _usage.get("prompt_tokens"),
             "completion_tokens": _usage.get("completion_tokens"),
             "latency_s": round(_latency, 3),
+            **_cache_fields,
         })
         if _pc_dir:
             import json as _pc_json
