@@ -1,11 +1,11 @@
 """Parse actions & format observations with toolcalls"""
 
 import json
-import time
 
 from jinja2 import StrictUndefined, Template
 
 from minisweagent.exceptions import FormatError
+from minisweagent.models.utils.observation import observation_metadata
 from minisweagent.models.utils.openai_multimodal import expand_multimodal_content
 
 BASH_TOOL = {
@@ -84,13 +84,7 @@ def format_toolcall_observation_messages(
         )
         msg = {
             "content": content,
-            "extra": {
-                "raw_output": output.get("output", ""),
-                "returncode": output.get("returncode"),
-                "timestamp": time.time(),
-                "exception_info": output.get("exception_info"),
-                **output.get("extra", {}),
-            },
+            "extra": observation_metadata(output),
         }
         if "tool_call_id" in action:
             msg["tool_call_id"] = action["tool_call_id"]

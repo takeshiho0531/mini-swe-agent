@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded
-from minisweagent.utils.serialize import recursive_merge
+from minisweagent.utils.serialize import atomic_write_json, recursive_merge
 
 
 class AgentConfig(BaseModel):
@@ -951,6 +951,5 @@ class DefaultAgent:
         """
         data = self.serialize(*extra_dicts)
         if path:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2))
+            atomic_write_json(path, data)
         return data

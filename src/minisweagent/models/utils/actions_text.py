@@ -4,11 +4,11 @@ As of mini-swe-agent v2.0, we strongly recommend to use toolcalls instead.
 """
 
 import re
-import time
 
 from jinja2 import StrictUndefined, Template
 
 from minisweagent.exceptions import FormatError
+from minisweagent.models.utils.observation import observation_metadata
 from minisweagent.models.utils.openai_multimodal import expand_multimodal_content
 
 
@@ -59,13 +59,7 @@ def format_observation_messages(
         msg: dict = {
             "role": "user",
             "content": content,
-            "extra": {
-                "raw_output": output.get("output", ""),
-                "returncode": output.get("returncode"),
-                "timestamp": time.time(),
-                "exception_info": output.get("exception_info"),
-                **output.get("extra", {}),
-            },
+            "extra": observation_metadata(output),
         }
         if multimodal_regex:
             msg = expand_multimodal_content(msg, pattern=multimodal_regex)
