@@ -80,6 +80,17 @@ class DefaultAgent:
         # online TRC accumulators
         self._mem_online_trc_flags: list[str] = []
         self._mem_online_trc_tokens_saved: int = 0
+        # online Claude extract accumulators (one record per extraction attempt)
+        self._mem_online_claude_extract_events: list[dict] = []
+        self._mem_online_claude_extract_tokens_saved: int = 0
+        self._mem_online_claude_extract_consecutive_errors: int = 0
+        self._mem_online_claude_select_events: list[dict] = []
+        self._mem_online_claude_select_tokens_saved: int = 0
+        self._mem_online_claude_select_consecutive_errors: int = 0
+        # Complete, uncompressed record of every message added (same objects
+        # as first added; compression replaces self.messages, never these).
+        # online_claude_select re-selects from it before every call.
+        self._full_messages: list[dict] = []
 
         self._memory_policy = None
         self._memory_config = None
@@ -111,6 +122,10 @@ class DefaultAgent:
         self._evt_seq  = 0   # shared ordering counter for messages and compression events
         self._evt_n_compression = 0
 
+    # per-step (online) compression kinds; a query with one of these advances
+    # the online interval clock of the adaptive policy
+    _ONLINE_EVENT_KINDS = ("online_trc", "online_claude_extract", "online_claude_select")
+
     def _advance_memory_policy(self, config, events):
         """Notify after an event; selected settings take effect on the next query.
 
@@ -123,7 +138,8 @@ class DefaultAgent:
         from agentctx.compression.adaptive import CompressionConfig, CompressionEvent
 
         kinds = tuple(event["kind"] for event in events)
-        kind = "online_trc" if "online_trc" in kinds else "budget"
+        _online_kinds = [k for k in kinds if k in self._ONLINE_EVENT_KINDS]
+        kind = _online_kinds[0] if _online_kinds else "budget"
         tokens_before, tokens_after = events[0]["tokens_before"], events[-1]["tokens_after"]
         record = {
             "events": copy.deepcopy(events),
@@ -135,7 +151,7 @@ class DefaultAgent:
             "status": "pending",
         }
         self._mem_adaptive_events.append(record)
-        if "online_trc" in kinds:
+        if _online_kinds:
             self._memory_online_step = self.n_calls
         self._write_token_log()
         try:
@@ -187,6 +203,7 @@ class DefaultAgent:
                 "message": _m,
             })
         self.messages.extend(messages)
+        self._full_messages.extend(messages)
         return list(messages)
 
     # ── Event-log helpers ────────────────────────────────────────────────────
@@ -275,6 +292,7 @@ class DefaultAgent:
         """Run step() until agent is finished. Returns dictionary with exit_status, submission keys."""
         self.extra_template_vars |= {"task": task, **kwargs}
         self.messages = []
+        self._full_messages = []
         self.add_messages(
             self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
             self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
@@ -303,7 +321,7 @@ class DefaultAgent:
             self._salvage_interrupted_summary(memory)
             memory.write_token_log(self)
 
-    def _salvage_interrupted_summary(self, _mem) -> None:
+    def _salvage_interrupted_summary(self, _mem) -> dict | None:
         """Record the outcome of a compression event that did not complete.
 
         The event pops its summary outcome right after the primitive returns.
@@ -311,17 +329,27 @@ class DefaultAgent:
         exception leaves query() before that pop, and run()'s finally lands
         here. The responses already received still occupied KV blocks, so
         their ids are kept: the entry gets accepted=False and the exception
-        type in "interrupted". Nothing is recorded when the failed event never
-        requested a summary.
+        type in "interrupted". The tokens and latency those completed attempts
+        consumed (kept running in the outcome by request_summary) are added to
+        the summarization accumulators, which the primitive would have done
+        had it returned. Nothing is recorded when the failed event never
+        requested a summary. Returns the recorded entry, or None.
         """
         context = self._mem_active_compression
         if context is None or not hasattr(_mem, "pop_summary_outcome"):
-            return
+            return None
         self._mem_active_compression = None
         outcome = _mem.pop_summary_outcome()
         if outcome is None:
-            return
-        self._mem_summary_outcomes.append({
+            return None
+        _pt  = int(outcome.get("prompt_tokens") or 0)
+        _ct  = int(outcome.get("completion_tokens") or 0)
+        _lat = float(outcome.get("latency_s") or 0.0)
+        self._mem_prompt_tokens               += _pt
+        self._mem_completion_tokens           += _ct
+        self._mem_summarization_prompt_tokens += _pt
+        self._mem_summarization_latency_s     += _lat
+        entry = {
             **context,
             "attempts":   outcome.get("attempts"),
             "accepted":   False,
@@ -331,7 +359,145 @@ class DefaultAgent:
             "response_ids": list(outcome.get("response_ids") or []),
             "interrupted": outcome.get("interrupted") or "unknown",
             "interrupted_attempt": outcome.get("interrupted_attempt"),
+            "prompt_tokens": _pt,
+            "completion_tokens": _ct,
+            "latency_s": round(_lat, 3),
+        }
+        self._mem_summary_outcomes.append(entry)
+        return entry
+
+    def _online_claude_extract(self) -> dict | None:
+        """online_claude_extract: see _online_claude()."""
+        return self._online_claude("extract")
+
+    def _online_claude_select(self) -> dict | None:
+        """online_claude_select: see _online_claude()."""
+        return self._online_claude("select")
+
+    def _online_claude(self, kind: str) -> dict | None:
+        """Run memory.online_claude_extract() / online_claude_select() and record it.
+
+        ``kind`` is "extract" (Claude rewrites the compressible window of the
+        current context) or "select" (Claude picks messages / output lines
+        from the complete history, self._full_messages, and the context is
+        rebuilt from the original text). Both take MSWEA_EXTRACT_KEEP_RECENT
+        (default 1: the newest turn stays verbatim) and share the extractor
+        settings (MSWEA_EXTRACT_MODEL / _EFFORT / ...).
+
+        Returns the per-attempt record appended to
+        _mem_online_claude_<kind>_events, or None when there was nothing to
+        process (history still within the protected prefix + kept tail, after
+        the tail is widened to its turn).
+
+        Records one entry in _mem_online_claude_<kind>_events whether or not
+        the reply was accepted, a compression event of kind
+        "online_claude_<kind>" in compression_events.jsonl when the history
+        changed, and the summary outcome (attempts, rejections, response ids;
+        for "select" also flags["selection"]) like a budget event. An
+        extractor error (transport, auth, ...) leaves the history unchanged
+        and is logged; after MSWEA_EXTRACT_MAX_CONSECUTIVE_ERRORS consecutive
+        errors (default 3) it propagates and ends the run, so a misconfigured
+        key does not silently turn the condition into full context.
+        """
+        import memory as _mem
+        if kind not in ("extract", "select"):
+            raise ValueError(f"kind must be extract | select, got {kind!r}")
+        _primitive = f"online_claude_{kind}"
+        _events    = getattr(self, f"_mem_online_claude_{kind}_events")
+        _errors_attr = f"_mem_online_claude_{kind}_consecutive_errors"
+        _saved_attr  = f"_mem_online_claude_{kind}_tokens_saved"
+        _keep    = max(0, int(os.environ.get("MSWEA_EXTRACT_KEEP_RECENT", "1") or "1"))
+        _max_err = max(1, int(os.environ.get("MSWEA_EXTRACT_MAX_CONSECUTIVE_ERRORS", "3") or "3"))
+        _source  = self._full_messages if kind == "select" else self.messages
+        if len(_source) <= _mem.N_PROTECTED + _keep:
+            return None
+        _before     = _mem.count_tokens(self.messages)
+        _evt_before = self._evt_snapshot(self.messages) if self._evt_dir else None
+        if hasattr(_mem, "pop_summary_outcome"):
+            _mem.pop_summary_outcome()   # discard anything stale before this event
+        self._mem_active_compression = {
+            "step": self.n_calls, "primitive": _primitive, "picked": None,
+        }
+        _event = {
+            "step": self.n_calls, "tokens_before": _before, "tokens_after": _before,
+            "accepted": False, "prompt_tokens": 0, "completion_tokens": 0,
+            "latency_s": 0.0, "error": None,
+        }
+        if kind == "select":
+            _event["tokens_full"] = _mem.count_tokens(self._full_messages)
+        _t0 = time.time()
+        try:
+            if kind == "select":
+                self.messages, _saved, _pt, _ct, _lat = _mem.online_claude_select(
+                    self._full_messages, self.messages, self.model, keep_recent=_keep
+                )
+            else:
+                self.messages, _saved, _pt, _ct, _lat = _mem.online_claude_extract(
+                    self.messages, self.model, keep_recent=_keep
+                )
+        except Exception as exc:   # noqa: BLE001 - recorded, re-raised past the error cap
+            _event["error"]     = f"{type(exc).__name__}: {exc}"
+            _event["latency_s"] = round(time.time() - _t0, 3)
+            _events.append(_event)
+            setattr(self, _errors_attr, getattr(self, _errors_attr) + 1)
+            _salvaged = self._salvage_interrupted_summary(_mem)   # ids + usage of completed attempts
+            if _salvaged is not None:
+                _event["prompt_tokens"]     = _salvaged["prompt_tokens"]
+                _event["completion_tokens"] = _salvaged["completion_tokens"]
+            self._write_token_log()
+            if getattr(self, _errors_attr) >= _max_err:
+                raise
+            self.logger.warning(
+                "%s failed at step %d (%d consecutive): %s",
+                _primitive, self.n_calls, getattr(self, _errors_attr), _event["error"],
+            )
+            return _event
+        setattr(self, _errors_attr, 0)
+        _sum_outcome = _mem.pop_summary_outcome() if hasattr(_mem, "pop_summary_outcome") else None
+        self._mem_active_compression = None
+        if _sum_outcome is None:
+            # No extractor request was made: the window was empty once the kept
+            # tail was widened to its turn boundary. Same as the first call,
+            # nothing happened, so no event (and no policy notification).
+            return None
+        _after    = _mem.count_tokens(self.messages)
+        _accepted = bool(_sum_outcome and _sum_outcome.get("accepted"))
+        _event.update({
+            "tokens_after": _after, "accepted": _accepted,
+            "prompt_tokens": _pt, "completion_tokens": _ct, "latency_s": round(_lat, 3),
         })
+        if kind == "select" and _accepted:
+            _event["selection"] = (_sum_outcome.get("flags") or {}).get("selection")
+        _events.append(_event)
+        setattr(self, _saved_attr, getattr(self, _saved_attr) + _saved)
+        self._mem_prompt_tokens               += _pt
+        self._mem_completion_tokens           += _ct
+        self._mem_summarization_prompt_tokens += _pt
+        self._mem_summarization_latency_s     += _lat
+        if _sum_outcome is not None:
+            self._mem_summary_outcomes.append({
+                "step":       self.n_calls,
+                "primitive":  _primitive,
+                "picked":     None,
+                "attempts":   _sum_outcome.get("attempts"),
+                "accepted":   _sum_outcome.get("accepted"),
+                "rejections": _sum_outcome.get("rejections", []),
+                "fallback":   _sum_outcome.get("fallback"),
+                "flags":      _sum_outcome.get("flags"),
+                "response_ids": list(_sum_outcome.get("response_ids") or []),
+            })
+        if _accepted and _evt_before is not None:
+            self._evt_record_compression(
+                _primitive, _evt_before, primitive=_primitive,
+                keep_recent=_keep, target_tokens=None, budget=None,
+                tokens_saved_reported=_saved,
+                summary_prompt_tokens=_pt, summary_latency_s=_lat,
+                summary_outcome=_sum_outcome,
+            )
+        self._write_token_log()
+        if self.config.output_path:
+            self.save(self.config.output_path)
+        return _event
 
     def step(self) -> list[dict]:
         """Query the LM, execute actions."""
@@ -446,7 +612,8 @@ class DefaultAgent:
             import memory as _mem_otrc
 
             _OTRC_STUB       = "[tool-result cleared"
-            _OTRC_SKIP_PREFIX = (_OTRC_STUB, "[TOOL OUTPUT CLEARED", "[CONTEXT SUMMARY", "[COMPRESSED HISTORY")
+            _OTRC_SKIP_PREFIX = (_OTRC_STUB, "[TOOL OUTPUT CLEARED", "[CONTEXT SUMMARY", "[COMPRESSED HISTORY",
+                                 "[CONTEXT EXTRACT")
 
             def _otrc_clearable(msg: dict) -> bool:
                 # Summaries are identified the same way as in the offline TRC
@@ -506,6 +673,42 @@ class DefaultAgent:
                     "tokens_after": _online_tokens, "skipped_reason": "no_eligible_result",
                 })
         # ── End online TRC hook ──────────────────────────────────────────────
+
+        # ── Online Claude extract hook ───────────────────────────────────────
+        # online_claude_extract: before every model call, once the previous
+        # call's observation is in the history, the compressible window
+        # (everything after the protected system prompt + task statement,
+        # newest observation included) is handed to Claude and replaced by its
+        # extract of what the task still needs; the call then sees
+        # [system, task, extract] (+ MSWEA_EXTRACT_KEEP_RECENT newest messages
+        # verbatim). Cadence: the adaptive step_interval when a policy is
+        # active, else every MSWEA_EXTRACT_EVERY calls (default 1). The first
+        # call has nothing to extract yet.
+        # online_claude_select is the extractive sibling: the selector sees the
+        # complete history (self._full_messages) and the context is rebuilt from
+        # the original messages / output lines it keeps (see _online_claude).
+        if _primitive in ("online_claude_extract", "online_claude_select") and self.n_calls > 0:
+            if _adaptive_config is not None:
+                _ex_due = _online_due
+            else:
+                _ex_every = max(1, int(os.environ.get("MSWEA_EXTRACT_EVERY", "1") or "1"))
+                _ex_due = self.n_calls % _ex_every == 0
+            if _ex_due:
+                if _pc_dir and _pc_pre is None:
+                    import copy as _pc_copy_ex
+                    _pc_pre = _pc_copy_ex.deepcopy(self.messages)
+                _ex_rec = self._online_claude(_primitive.rsplit("_", 1)[1])
+                if _ex_rec is not None:
+                    _pc_fired = _pc_fired or bool(_ex_rec.get("accepted"))
+                    if _adaptive_config is not None:
+                        _adaptive_events.append({
+                            "kind": _primitive,
+                            "tokens_before": _ex_rec["tokens_before"],
+                            "tokens_after":  _ex_rec["tokens_after"],
+                            **({} if _ex_rec.get("accepted") else
+                               {"skipped_reason": "error" if _ex_rec.get("error") else "rejected"}),
+                        })
+        # ── End online Claude extract hook ───────────────────────────────────
 
         if _primitive and _budget is not None and _budget > 0:
             import memory as _mem   # agentCtx root must be on PYTHONPATH
@@ -651,6 +854,11 @@ class DefaultAgent:
                 elif _primitive == "online_trc":
                     # OTRC+TR: freeze window already cleared the oldest-outside-window result above;
                     # truncation fires here as the budget-time fallback.
+                    self.messages, _saved = _mem.truncate(self.messages, _target)
+                elif _primitive in ("online_claude_extract", "online_claude_select"):
+                    # online_claude_extract / _select rewrote the history above
+                    # (see _online_claude); with a budget set, truncation is
+                    # the budget-time fallback, as for online_trc.
                     self.messages, _saved = _mem.truncate(self.messages, _target)
                 elif _primitive == "online_trc_summarize_partial":
                     # OTRC+SU-partial: freeze window already cleared a result above;
