@@ -87,6 +87,19 @@ class DefaultAgent:
         self._mem_online_claude_select_events: list[dict] = []
         self._mem_online_claude_select_tokens_saved: int = 0
         self._mem_online_claude_select_consecutive_errors: int = 0
+        # Per-output pre-extraction accumulators (MSWEA_OUTPUT_EXTRACT_ABOVE,
+        # memory.extract_tool_output; see _output_extract): one record per new
+        # tool output above the threshold.
+        self._mem_output_extract_events: list[dict] = []
+        self._mem_output_extract_tokens_saved: int = 0
+        self._mem_output_extract_consecutive_errors: int = 0
+        self._mem_output_extract_threshold: int = 0
+        # Phase-boundary gate on the threshold firing (MSWEA_PHASE_GATE,
+        # memory.judge_phase_boundary; see _phase_gate): one record per due
+        # firing, asked or forced.
+        self._mem_phase_judge_events: list[dict] = []
+        self._mem_phase_judge_consecutive_errors: int = 0
+        self._mem_phase_judge_config: dict | None = None
         # Complete, uncompressed record of every message added (same objects
         # as first added; compression replaces self.messages, never these).
         # online_claude_select re-selects from it before every call.
@@ -109,6 +122,21 @@ class DefaultAgent:
                 self._memory_selection = selection_metadata(
                     load_selection(os.environ["MSWEA_ADAPTIVE_MANIFEST"])
                 )
+
+        # ── CLM self-editing (inert unless MSWEA_PRIMITIVE=clm) ──────────────
+        # The agent compacts its own context by editing a mirror file in the
+        # task container (agentctx.compression.clm). No primitive fires on its
+        # own: the session nudges, and at the context limit rolls the newest
+        # turns back. Hooks: query() (before / after the model call) and
+        # execute_actions() (around the action).
+        self._clm = None
+        if os.environ.get("MSWEA_PRIMITIVE", "") == "clm":
+            if self._memory_config is not None:
+                raise ValueError("MSWEA_PRIMITIVE=clm cannot be combined with an adaptive policy")
+            from agentctx.compression.clm import ClmSession
+            self._clm = ClmSession.from_env()
+            # {{context_budget}} of the clm system prompt (configs/config-clm.yaml)
+            self.extra_template_vars["context_budget"] = self._clm.budget_label
 
         # ── Event log (inert unless MSWEA_EVENT_LOG_DIR is set) ──────────────
         # Every message gets a stable uid in extra["uid"] when it is added, and
@@ -380,7 +408,10 @@ class DefaultAgent:
         ``kind`` is "extract" (Claude rewrites the compressible window of the
         current context) or "select" (Claude picks messages / output lines
         from the complete history, self._full_messages, and the context is
-        rebuilt from the original text). Both take MSWEA_EXTRACT_KEEP_RECENT
+        rebuilt from the original text; with MSWEA_SELECT_SOURCE=context,
+        memory.select_source(), it picks from the current context instead,
+        i.e. the previous selection plus the newest turn, so the context can
+        only shrink). Both take MSWEA_EXTRACT_KEEP_RECENT
         (default 1: the newest turn stays verbatim) and share the extractor
         settings (MSWEA_EXTRACT_MODEL / _EFFORT / ...).
 
@@ -408,7 +439,8 @@ class DefaultAgent:
         _saved_attr  = f"_mem_online_claude_{kind}_tokens_saved"
         _keep    = max(0, int(os.environ.get("MSWEA_EXTRACT_KEEP_RECENT", "1") or "1"))
         _max_err = max(1, int(os.environ.get("MSWEA_EXTRACT_MAX_CONSECUTIVE_ERRORS", "3") or "3"))
-        _source  = self._full_messages if kind == "select" else self.messages
+        _sel_source = _mem.select_source() if kind == "select" else None
+        _source  = self._full_messages if _sel_source == "full" else self.messages
         if len(_source) <= _mem.N_PROTECTED + _keep:
             return None
         _before     = _mem.count_tokens(self.messages)
@@ -425,11 +457,12 @@ class DefaultAgent:
         }
         if kind == "select":
             _event["tokens_full"] = _mem.count_tokens(self._full_messages)
+            _event["source"] = _sel_source
         _t0 = time.time()
         try:
             if kind == "select":
                 self.messages, _saved, _pt, _ct, _lat = _mem.online_claude_select(
-                    self._full_messages, self.messages, self.model, keep_recent=_keep
+                    _source, self.messages, self.model, keep_recent=_keep, source=_sel_source
                 )
             else:
                 self.messages, _saved, _pt, _ct, _lat = _mem.online_claude_extract(
@@ -498,6 +531,103 @@ class DefaultAgent:
         if self.config.output_path:
             self.save(self.config.output_path)
         return _event
+
+    def _phase_gate(self, ctx_tokens: int, cfg: dict) -> bool:
+        """Phase-boundary gate on a due threshold firing (MSWEA_PHASE_GATE=1,
+        added 2026-11-12 for the condition
+        online-claude-select-threshold-output-extract-15k-phase).
+
+        Called from query() when the online Claude hook is due and the context
+        exceeds MSWEA_EXTRACT_FIRE_ABOVE (``ctx_tokens`` is its size). Returns
+        True when the selector / extractor should fire now:
+
+        * above ``cfg["force_above"]`` (MSWEA_PHASE_GATE_FORCE_ABOVE, when not
+          0) it fires without asking (record ``forced``);
+        * otherwise memory.judge_phase_boundary() shows the extractor model the
+          task statement and the current context and asks whether the newest
+          turn is a natural break in the agent's work; "boundary" fires,
+          "continue" defers (the step runs with the context untouched and the
+          question is asked again before the next step);
+        * when no reply is accepted (fallback) or the judge errors below the
+          error cap, it fires, as it would without the gate, so a judge that
+          cannot answer never holds the compaction back.
+
+        Records one entry per call in _mem_phase_judge_events (verdict, reason,
+        outcome, forced, fired, usage), the summary outcome like a selector
+        call (primitive "phase_judge"), and the judge's tokens in the
+        summarization accumulators. Errors are handled like _online_claude:
+        logged, and after MSWEA_EXTRACT_MAX_CONSECUTIVE_ERRORS consecutive ones
+        re-raised. The judge changes no message, so nothing is written to
+        compression_events.jsonl.
+        """
+        import memory as _mem
+        _event = {
+            "step": self.n_calls, "tokens": ctx_tokens, "verdict": None, "reason": None,
+            "outcome": None, "forced": False, "fired": False, "accepted": False,
+            "prompt_tokens": 0, "completion_tokens": 0, "latency_s": 0.0, "error": None,
+        }
+        _force = int(cfg.get("force_above") or 0)
+        if _force and ctx_tokens > _force:
+            _event.update({"outcome": "forced", "forced": True, "fired": True})
+            self._mem_phase_judge_events.append(_event)
+            self._write_token_log()
+            return True
+        _max_err = max(1, int(os.environ.get("MSWEA_EXTRACT_MAX_CONSECUTIVE_ERRORS", "3") or "3"))
+        _task_src = self._full_messages if len(self._full_messages) >= _mem.N_PROTECTED else self.messages
+        _task_text = _mem._history_text(_task_src[1:_mem.N_PROTECTED])
+        if hasattr(_mem, "pop_summary_outcome"):
+            _mem.pop_summary_outcome()
+        self._mem_active_compression = {"step": self.n_calls, "primitive": "phase_judge", "picked": None}
+        _t0 = time.time()
+        try:
+            _rec, _pt, _ct, _lat = _mem.judge_phase_boundary(self.messages, _task_text)
+        except Exception as exc:   # noqa: BLE001 - recorded, re-raised past the error cap
+            _event["error"]     = f"{type(exc).__name__}: {exc}"
+            _event["latency_s"] = round(time.time() - _t0, 3)
+            _event.update({"outcome": "error", "fired": True})
+            self._mem_phase_judge_events.append(_event)
+            self._mem_phase_judge_consecutive_errors += 1
+            _salvaged = self._salvage_interrupted_summary(_mem)
+            if _salvaged is not None:
+                _event["prompt_tokens"]     = _salvaged["prompt_tokens"]
+                _event["completion_tokens"] = _salvaged["completion_tokens"]
+            self._write_token_log()
+            if self._mem_phase_judge_consecutive_errors >= _max_err:
+                raise
+            self.logger.warning(
+                "phase_judge failed at step %d (%d consecutive): %s; firing without a verdict",
+                self.n_calls, self._mem_phase_judge_consecutive_errors, _event["error"],
+            )
+            return True
+        self._mem_phase_judge_consecutive_errors = 0
+        _sum_outcome = _mem.pop_summary_outcome() if hasattr(_mem, "pop_summary_outcome") else None
+        self._mem_active_compression = None
+        _accepted = bool(_sum_outcome and _sum_outcome.get("accepted"))
+        _fire = _rec.get("verdict") != "continue"      # boundary, or no verdict (fallback) -> fire
+        _event.update({
+            "verdict": _rec.get("verdict"), "reason": _rec.get("reason"), "outcome": _rec.get("outcome"),
+            "fired": _fire, "accepted": _accepted,
+            "prompt_tokens": _pt, "completion_tokens": _ct, "latency_s": round(_lat, 3),
+        })
+        self._mem_phase_judge_events.append(_event)
+        self._mem_prompt_tokens               += _pt
+        self._mem_completion_tokens           += _ct
+        self._mem_summarization_prompt_tokens += _pt
+        self._mem_summarization_latency_s     += _lat
+        if _sum_outcome is not None:
+            self._mem_summary_outcomes.append({
+                "step":       self.n_calls,
+                "primitive":  "phase_judge",
+                "picked":     None,
+                "attempts":   _sum_outcome.get("attempts"),
+                "accepted":   _sum_outcome.get("accepted"),
+                "rejections": _sum_outcome.get("rejections", []),
+                "fallback":   _sum_outcome.get("fallback"),
+                "flags":      _sum_outcome.get("flags"),
+                "response_ids": list(_sum_outcome.get("response_ids") or []),
+            })
+        self._write_token_log()
+        return _fire
 
     def step(self) -> list[dict]:
         """Query the LM, execute actions."""
@@ -682,10 +812,15 @@ class DefaultAgent:
         # extract of what the task still needs; the call then sees
         # [system, task, extract] (+ MSWEA_EXTRACT_KEEP_RECENT newest messages
         # verbatim). Cadence: the adaptive step_interval when a policy is
-        # active, else every MSWEA_EXTRACT_EVERY calls (default 1). The first
-        # call has nothing to extract yet.
+        # active, else every MSWEA_EXTRACT_EVERY calls (default 1); with
+        # MSWEA_EXTRACT_FIRE_ABOVE=<tokens> (added 2026-11-12) a due call fires
+        # only while the current context exceeds that many tokens, so between
+        # firings the context is append-only (prefix-cache friendly) and the
+        # selector / extractor compacts it at the threshold. The first call
+        # has nothing to extract yet.
         # online_claude_select is the extractive sibling: the selector sees the
-        # complete history (self._full_messages) and the context is rebuilt from
+        # complete history (self._full_messages; the current context instead
+        # with MSWEA_SELECT_SOURCE=context) and the context is rebuilt from
         # the original messages / output lines it keeps (see _online_claude).
         if _primitive in ("online_claude_extract", "online_claude_select") and self.n_calls > 0:
             if _adaptive_config is not None:
@@ -693,6 +828,21 @@ class DefaultAgent:
             else:
                 _ex_every = max(1, int(os.environ.get("MSWEA_EXTRACT_EVERY", "1") or "1"))
                 _ex_due = self.n_calls % _ex_every == 0
+            _ex_above = int(os.environ.get("MSWEA_EXTRACT_FIRE_ABOVE", "0") or "0")
+            if _ex_above < 0:
+                raise ValueError(f"MSWEA_EXTRACT_FIRE_ABOVE must be a non-negative token count, got {_ex_above}")
+            import memory as _mem_fire
+            _pg = _mem_fire.phase_gate_config(_ex_above) if hasattr(_mem_fire, "phase_gate_config") else None
+            self._mem_phase_judge_config = _pg
+            if _ex_due and _ex_above:
+                _ctx_tokens = _mem_fire.count_tokens(self.messages)
+                _ex_due = _ctx_tokens > _ex_above
+                # MSWEA_PHASE_GATE=1 (added 2026-11-12): a due firing is first put
+                # to the extractor model as a question (is the newest turn a phase
+                # boundary?) and fires only on "boundary", or without asking above
+                # the force ceiling; see _phase_gate.
+                if _ex_due and _pg is not None:
+                    _ex_due = self._phase_gate(_ctx_tokens, _pg)
             if _ex_due:
                 if _pc_dir and _pc_pre is None:
                     import copy as _pc_copy_ex
@@ -710,7 +860,12 @@ class DefaultAgent:
                         })
         # ── End online Claude extract hook ───────────────────────────────────
 
-        if _primitive and _budget is not None and _budget > 0:
+        if _primitive == "clm" and self._clm is None:
+            raise RuntimeError("the clm primitive is set up from MSWEA_PRIMITIVE=clm when the "
+                               "agent starts; it is not available through an adaptive policy")
+        # clm has no budget-triggered primitive: its budget is enforced by the
+        # session (nudges / rollback) just before the model call below.
+        if _primitive and _primitive != "clm" and _budget is not None and _budget > 0:
             import memory as _mem   # agentCtx root must be on PYTHONPATH
             _depth = _adaptive_config.depth if _adaptive_config is not None else _mem.COMPRESSION_RATIO
             # Measure the current context window size (= full history size).
@@ -1037,6 +1192,17 @@ class DefaultAgent:
                 # compression event can fire before the next model call.
         # ────────────────────────────────────────────────────────────────────
 
+        if self._clm is not None and self._clm.before_call(self) == "stop":
+            # The final turn at the context limit has been taken and the context
+            # is still over it: end the run (nothing was submitted).
+            raise LimitsExceeded(
+                {
+                    "role": "exit",
+                    "content": "ContextBudgetExceeded",
+                    "extra": {"exit_status": "ContextBudgetExceeded", "submission": ""},
+                }
+            )
+
         self._advance_memory_policy(_adaptive_config, _adaptive_events)
         self.n_calls += 1
         if _pc_dir:
@@ -1079,6 +1245,8 @@ class DefaultAgent:
         self._mem_call_latencies.append(_latency)
         self._mem_step_prompt_tokens.append(_step_pt)
         self._mem_step_completion_tokens.append(_step_ct)
+        if self._clm is not None:
+            self._clm.after_call(_step_pt)
         _call_status = (
             "ok" if _query_error is None
             else "format_error" if isinstance(_query_error, FormatError) else "error"
@@ -1126,8 +1294,145 @@ class DefaultAgent:
 
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
+        self._clm_before_actions(message)
         outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
-        return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
+        observations = self.add_messages(*self._observation_messages(message, outputs))
+        self._output_extract(message, observations)
+        return observations
+
+    def _output_extract(self, message: dict, observations: list[dict]) -> None:
+        """Per-output pre-extraction (MSWEA_OUTPUT_EXTRACT_ABOVE=<tokens>, added
+        2026-11-12 for the condition online-claude-select-threshold-output-extract).
+
+        Runs right after the observations of a step were added to the history.
+        Every observation above the threshold (memory.count_tokens of the
+        message; 0 = off) is handed to the extractor model with the task
+        statement and the agent message that issued the command, and the
+        extractor's line selection replaces the observation's content IN
+        PLACE (memory.extract_tool_output): the same message object sits in
+        self.messages and self._full_messages, so the omitted lines leave the
+        context, the complete history that later threshold selections are
+        made from, and the trajectory at once. events.jsonl keeps the raw
+        observation (logged by add_messages before this runs) and the change
+        is recorded as a compression event of kind "output_extract" with the
+        uid in ``replaced``, so reconstruct_context.py replays it.
+
+        Records one entry per processed output in _mem_output_extract_events
+        (accepted or not), the summary outcome like a selector call, and the
+        extractor tokens in the summarization accumulators. Errors are
+        handled like _online_claude: logged, and after
+        MSWEA_EXTRACT_MAX_CONSECUTIVE_ERRORS consecutive ones re-raised.
+        """
+        import memory as _mem
+        _above = _mem.output_extract_threshold() if hasattr(_mem, "output_extract_threshold") else 0
+        self._mem_output_extract_threshold = _above
+        if not _above or not observations:
+            return
+        _max_err = max(1, int(os.environ.get("MSWEA_EXTRACT_MAX_CONSECUTIVE_ERRORS", "3") or "3"))
+        _task_src = self._full_messages if len(self._full_messages) >= _mem.N_PROTECTED else self.messages
+        _task_text = _mem._history_text(_task_src[1:_mem.N_PROTECTED])
+        for _obs in observations:
+            if _obs.get("role") not in ("user", "tool") or not isinstance(_obs.get("content"), str):
+                continue
+            _before = _mem.count_tokens([_obs])
+            if _before <= _above:
+                continue
+            self._evt_tag(_obs)
+            _evt_before = self._evt_snapshot(self.messages) if self._evt_dir else None
+            if hasattr(_mem, "pop_summary_outcome"):
+                _mem.pop_summary_outcome()
+            self._mem_active_compression = {
+                "step": self.n_calls, "primitive": "output_extract", "picked": None,
+            }
+            _event = {
+                "step": self.n_calls, "uid": _obs["extra"]["uid"],
+                "tokens_before": _before, "tokens_after": _before,
+                "lines_total": len(_obs["content"].split("\n")), "lines_kept": None,
+                "outcome": None, "accepted": False,
+                "prompt_tokens": 0, "completion_tokens": 0, "latency_s": 0.0, "error": None,
+            }
+            _t0 = time.time()
+            try:
+                _new, _rec, _pt, _ct, _lat = _mem.extract_tool_output(_obs, message, _task_text)
+            except Exception as exc:   # noqa: BLE001 - recorded, re-raised past the error cap
+                _event["error"]     = f"{type(exc).__name__}: {exc}"
+                _event["latency_s"] = round(time.time() - _t0, 3)
+                self._mem_output_extract_events.append(_event)
+                self._mem_output_extract_consecutive_errors += 1
+                _salvaged = self._salvage_interrupted_summary(_mem)
+                if _salvaged is not None:
+                    _event["prompt_tokens"]     = _salvaged["prompt_tokens"]
+                    _event["completion_tokens"] = _salvaged["completion_tokens"]
+                self._write_token_log()
+                if self._mem_output_extract_consecutive_errors >= _max_err:
+                    raise
+                self.logger.warning(
+                    "output_extract failed at step %d (%d consecutive): %s",
+                    self.n_calls, self._mem_output_extract_consecutive_errors, _event["error"],
+                )
+                continue
+            self._mem_output_extract_consecutive_errors = 0
+            _sum_outcome = _mem.pop_summary_outcome() if hasattr(_mem, "pop_summary_outcome") else None
+            self._mem_active_compression = None
+            _accepted = bool(_sum_outcome and _sum_outcome.get("accepted"))
+            if _new is not None:
+                _obs["content"] = _new
+                # The raw output copy mini-swe-agent keeps in the metadata goes too: the
+                # trajectory then holds nothing of the omitted lines (events.jsonl does).
+                _obs.setdefault("extra", {}).pop("raw_output", None)
+                _obs["extra"]["output_extract"] = {
+                    k: _rec.get(k) for k in ("outcome", "lines_total", "lines_kept",
+                                             "tokens_before", "tokens_after", "keep")
+                } | {"step": self.n_calls}
+            _event.update({
+                "tokens_after": _rec.get("tokens_after", _before), "lines_kept": _rec.get("lines_kept"),
+                "outcome": _rec.get("outcome"), "accepted": _accepted,
+                "prompt_tokens": _pt, "completion_tokens": _ct, "latency_s": round(_lat, 3),
+            })
+            self._mem_output_extract_events.append(_event)
+            self._mem_output_extract_tokens_saved += max(0, _before - _event["tokens_after"])
+            self._mem_prompt_tokens               += _pt
+            self._mem_completion_tokens           += _ct
+            self._mem_summarization_prompt_tokens += _pt
+            self._mem_summarization_latency_s     += _lat
+            if _sum_outcome is not None:
+                self._mem_summary_outcomes.append({
+                    "step":       self.n_calls,
+                    "primitive":  "output_extract",
+                    "picked":     None,
+                    "attempts":   _sum_outcome.get("attempts"),
+                    "accepted":   _sum_outcome.get("accepted"),
+                    "rejections": _sum_outcome.get("rejections", []),
+                    "fallback":   _sum_outcome.get("fallback"),
+                    "flags":      _sum_outcome.get("flags"),
+                    "response_ids": list(_sum_outcome.get("response_ids") or []),
+                })
+            if _new is not None and _evt_before is not None:
+                self._evt_record_compression(
+                    "output_extract", _evt_before, primitive="output_extract",
+                    uid=_obs["extra"]["uid"], keep=_rec.get("keep"), outcome=_rec.get("outcome"),
+                    threshold=_above, keep_recent=None, target_tokens=None, budget=None,
+                    tokens_saved_reported=max(0, _before - _event["tokens_after"]),
+                    summary_prompt_tokens=_pt, summary_latency_s=_lat,
+                    summary_outcome=_sum_outcome,
+                )
+            self._write_token_log()
+            if self.config.output_path:
+                self.save(self.config.output_path)
+
+    def _clm_before_actions(self, message: dict) -> None:
+        """clm: mirror the context into the task container before the action runs."""
+        if self._clm is not None:
+            self._clm.before_actions(self, message)
+
+    def _observation_messages(self, message: dict, outputs: list[dict]) -> list[dict]:
+        """Observation messages for the executed actions. Under clm the context
+        mirror is read back first: an edit replaces self.messages, and the edit
+        note and context readout are appended to the observation."""
+        observations = self.model.format_observation_messages(message, outputs, self.get_template_vars())
+        if self._clm is not None and outputs:
+            observations = self._clm.after_actions(self, message, outputs, observations)
+        return observations
 
     def serialize(self, *extra_dicts) -> dict:
         """Serialize agent state to a json-compatible nested dictionary for saving."""

@@ -105,14 +105,14 @@ class InteractiveAgent(DefaultAgent):
         outputs = []
         try:
             self._ask_confirmation_or_interrupt(commands)
+            self._clm_before_actions(message)
             for action in actions:
                 outputs.append(self.env.execute(action))
         except Submitted as e:
             self._check_for_new_task_or_submit(e)
         finally:
-            result = self.add_messages(
-                *self.model.format_observation_messages(message, outputs, self.get_template_vars())
-            )
+            result = self.add_messages(*self._observation_messages(message, outputs))
+            self._output_extract(message, result)
         return result
 
     def _add_observation_messages(self, message: dict, outputs: list[dict]) -> list[dict]:
