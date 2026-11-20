@@ -111,7 +111,6 @@ class InteractiveAgent(DefaultAgent):
             self._check_for_new_task_or_submit(e)
         finally:
             result = self.add_messages(*self._observation_messages(message, outputs))
-            self._output_extract(message, result)
         return result
 
     def _add_observation_messages(self, message: dict, outputs: list[dict]) -> list[dict]:
