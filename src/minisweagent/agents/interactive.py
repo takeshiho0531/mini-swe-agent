@@ -105,7 +105,6 @@ class InteractiveAgent(DefaultAgent):
         outputs = []
         try:
             self._ask_confirmation_or_interrupt(commands)
-            self._clm_before_actions(message)
             for action in actions:
                 outputs.append(self.env.execute(action))
         except Submitted as e:

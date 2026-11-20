@@ -66,8 +66,6 @@ class DefaultAgent:
         self._mem_compression_event_steps: list[int] = []
         self._mem_context_tokens_at_compression: list[int] = []
         self._mem_context_tokens_after_compression: list[int] = []
-        self._mem_trc_fallback_events               = 0
-        self._mem_trc_events: list[dict] = []
         self._mem_tr_events: list[dict] = []
         # one record per compression event that requested a summary (see
         # memory.pop_summary_outcome): attempts, rejections, fallback to truncate
@@ -77,9 +75,6 @@ class DefaultAgent:
         # event before it pops its outcome, so _write_token_log() uses this to
         # salvage the partial outcome (response ids so far) of the failed event.
         self._mem_active_compression: dict | None = None
-        # online TRC accumulators
-        self._mem_online_trc_flags: list[str] = []
-        self._mem_online_trc_tokens_saved: int = 0
         # online Claude extract accumulators (one record per extraction attempt)
         self._mem_online_claude_extract_events: list[dict] = []
         self._mem_online_claude_extract_tokens_saved: int = 0
@@ -123,26 +118,11 @@ class DefaultAgent:
                     load_selection(os.environ["MSWEA_ADAPTIVE_MANIFEST"])
                 )
 
-        # ── CLM self-editing (inert unless MSWEA_PRIMITIVE=clm) ──────────────
-        # The agent compacts its own context by editing a mirror file in the
-        # task container (agentctx.compression.clm). No primitive fires on its
-        # own: the session nudges, and at the context limit rolls the newest
-        # turns back. Hooks: query() (before / after the model call) and
-        # execute_actions() (around the action).
-        self._clm = None
-        if os.environ.get("MSWEA_PRIMITIVE", "") == "clm":
-            if self._memory_config is not None:
-                raise ValueError("MSWEA_PRIMITIVE=clm cannot be combined with an adaptive policy")
-            from agentctx.compression.clm import ClmSession
-            self._clm = ClmSession.from_env()
-            # {{context_budget}} of the clm system prompt (configs/config-clm.yaml)
-            self.extra_template_vars["context_budget"] = self._clm.budget_label
-
         # ── Event log (inert unless MSWEA_EVENT_LOG_DIR is set) ──────────────
         # Every message gets a stable uid in extra["uid"] when it is added, and
         # is appended verbatim to <dir>/events.jsonl BEFORE any compression
         # primitive can touch it. Every compression event (budget-triggered or
-        # online TRC) is appended to <dir>/compression_events.jsonl as a diff
+        # online) is appended to <dir>/compression_events.jsonl as a diff
         # against uids (dropped / replaced / added) plus the ordered uid list
         # after the event, so the exact context at any step can be replayed.
         # See scripts/reconstruct_context.py in agentCtx.
@@ -152,7 +132,7 @@ class DefaultAgent:
 
     # per-step (online) compression kinds; a query with one of these advances
     # the online interval clock of the adaptive policy
-    _ONLINE_EVENT_KINDS = ("online_trc", "online_claude_extract", "online_claude_select")
+    _ONLINE_EVENT_KINDS = ("online_claude_extract", "online_claude_select")
 
     def _advance_memory_policy(self, config, events):
         """Notify after an event; selected settings take effect on the next query.
@@ -639,13 +619,12 @@ class DefaultAgent:
         Memory primitive hook
         ---------------------
         Reads two environment variables before every LLM call:
-          MSWEA_PRIMITIVE    : "truncation" | "summarization"
-                               | "summarization_free" | "structured_summarize_free" (no length target)
+          MSWEA_PRIMITIVE    : "truncation" | "summarization_free" (no length target)
+                               | "online_claude_extract" | "online_claude_select"
           MSWEA_TOKEN_BUDGET : int  — fires when estimated prompt tokens exceed this
 
-        Most primitives target current_tokens * COMPRESSION_RATIO. TRC instead
-        clears all but the latest three tool results, then drops oldest complete
-        turns only if needed to meet the budget. System and task are protected.
+        Budget-triggered primitives target budget * COMPRESSION_RATIO. System
+        and task are protected.
 
         Token usage and compression stats are accumulated on self._mem_* and written
         to MSWEA_TOKEN_LOG_PATH (if set) after every call.
@@ -686,13 +665,12 @@ class DefaultAgent:
         #
         # WHAT COMPRESSION DOES:
         #   Both primitives protect messages[0:2] (system + task) — never touched.
-        #   They operate only on messages[2:] (the agent's working history).
-        #   Standalone TR targets budget * COMPRESSION_RATIO; TRC targets budget.
-        #   Other policies retain their current_size * COMPRESSION_RATIO target.
+        #   They operate only on messages[2:] (the agent's working history) and
+        #   target budget * COMPRESSION_RATIO.
         #
         #   truncation  — drops oldest complete assistant/result turns until size
         #                 <= target, preserving the latest turn. No extra LLM call.
-        #   summarization — one extra LLM call produces a structured summary of
+        #   summarization_free — one extra LLM call produces a concise summary of
         #                 messages[2:], which replaces the entire compressible
         #                 window with a single summary message.
         #
@@ -714,95 +692,11 @@ class DefaultAgent:
         _pc_pre   = None     # pre-compression context snapshot (set iff compression fires this step)
         _pc_fired = False
 
-        # ── Online TRC hook ──────────────────────────────────────────────────
-        # Online TRC: freeze-window clearing.
-        # Protect the newest FREEZE_K tool results verbatim; every step, clear
-        # the newest tool result *outside* that window (≈ the result from step
-        # n-FREEZE_K-1 when the history is regular).
-        #
-        # The target is selected by ROLE, not by position.  An earlier version
-        # rewrote messages[-9] unconditionally; a FormatError (user message with
-        # no assistant reply), a truncation that drops an odd number of messages,
-        # or a summary insertion all shift message parity, and the fixed offset
-        # then landed on assistant messages or — when len(messages)==10 — on
-        # messages[1], the task statement itself.  Candidates here are user-role
-        # messages in the compressible window (index ≥ N_PROTECTED) that are not
-        # summaries and not already-cleared stubs, so the task statement and
-        # assistant turns can never be selected.
-        _FREEZE_K = _adaptive_config.freeze_k if _adaptive_config is not None else 4
-        _OTRC_FAMILY = (
-            "online_trc",
-            "online_trc_summarize_partial",
-            "online_trc_structured_summarize_partial",
-        )
+        # Cadence of the online primitives under an adaptive policy: the
+        # step_interval clock (None = every call).
         _step_interval = _adaptive_config.step_interval if _adaptive_config is not None else None
         _online_due = (_step_interval is None
                        or self.n_calls - self._memory_online_step >= _step_interval)
-        if _primitive in _OTRC_FAMILY and _online_due:
-            import memory as _mem_otrc
-
-            _OTRC_STUB       = "[tool-result cleared"
-            _OTRC_SKIP_PREFIX = (_OTRC_STUB, "[TOOL OUTPUT CLEARED", "[CONTEXT SUMMARY", "[COMPRESSED HISTORY",
-                                 "[CONTEXT EXTRACT")
-
-            def _otrc_clearable(msg: dict) -> bool:
-                # Summaries are identified the same way as in the offline TRC
-                # primitives (extra["kind"] tag first, marker prefix for old runs).
-                if msg.get("role") != "user" or _mem_otrc.is_summary_message(msg):
-                    return False
-                content = msg.get("content")
-                if not isinstance(content, str):
-                    return False
-                return not content.startswith(_OTRC_SKIP_PREFIX)
-
-            _otrc_candidates = [
-                i for i in range(_mem_otrc.N_PROTECTED, len(self.messages))
-                if _otrc_clearable(self.messages[i])
-            ]
-            if len(_otrc_candidates) > _FREEZE_K:
-                if _adaptive_config is not None:
-                    _online_before = _mem_otrc.count_tokens(self.messages)
-                _result_idx   = _otrc_candidates[-(_FREEZE_K + 1)]
-                _result_msg   = self.messages[_result_idx]
-                _orig_tokens  = _mem_otrc.count_tokens([_result_msg])
-                _step_cleared = self.n_calls - (_FREEZE_K + 1)   # approximate label (regular history)
-                _new_content  = f"[tool-result cleared — online-trc — {_orig_tokens} tok — step {_step_cleared}]"
-                _evt_before_otrc = self._evt_snapshot(self.messages) if self._evt_dir else None
-                self.messages[_result_idx] = {**_result_msg, "content": _new_content}
-                if _evt_before_otrc is not None:
-                    self._evt_record_compression(
-                        "online_trc", _evt_before_otrc, primitive=_primitive,
-                        flag_from_step=_step_cleared, target_tokens=None, budget=_budget,
-                        cleared_index=_result_idx,
-                        **({"adaptive_config": _adaptive_config.to_dict()}
-                           if _adaptive_config is not None else {}),
-                    )
-
-                _tokens_saved_otrc = max(0, _orig_tokens - _mem_otrc.count_tokens([self.messages[_result_idx]]))
-                self._mem_online_trc_flags.append({
-                    "step":           self.n_calls,
-                    "flag_from_step": _step_cleared,
-                    "tokens_cleared": _tokens_saved_otrc,
-                })
-                self._mem_online_trc_tokens_saved += _tokens_saved_otrc
-                _mem_otrc.write_token_log(self)
-                if _adaptive_config is not None:
-                    _adaptive_events.append({
-                        "kind": "online_trc", "tokens_before": _online_before,
-                        "tokens_after": _mem_otrc.count_tokens(self.messages),
-                    })
-            elif _step_interval is not None:
-                # The scheduled trigger still fires with no eligible result.
-                # This lets the policy select its next action without waiting
-                # for freeze-window eligibility (or losing the scheduled event).
-                _online_tokens = _mem_otrc.count_tokens(self.messages)
-                # No history changed: keep this trigger only in adaptive logs,
-                # so online_trc compression records continue to mean actual clears.
-                _adaptive_events.append({
-                    "kind": "online_trc", "tokens_before": _online_tokens,
-                    "tokens_after": _online_tokens, "skipped_reason": "no_eligible_result",
-                })
-        # ── End online TRC hook ──────────────────────────────────────────────
 
         # ── Online Claude extract hook ───────────────────────────────────────
         # online_claude_extract: before every model call, once the previous
@@ -860,12 +754,7 @@ class DefaultAgent:
                         })
         # ── End online Claude extract hook ───────────────────────────────────
 
-        if _primitive == "clm" and self._clm is None:
-            raise RuntimeError("the clm primitive is set up from MSWEA_PRIMITIVE=clm when the "
-                               "agent starts; it is not available through an adaptive policy")
-        # clm has no budget-triggered primitive: its budget is enforced by the
-        # session (nudges / rollback) just before the model call below.
-        if _primitive and _primitive != "clm" and _budget is not None and _budget > 0:
+        if _primitive and _budget is not None and _budget > 0:
             import memory as _mem   # agentCtx root must be on PYTHONPATH
             _depth = _adaptive_config.depth if _adaptive_config is not None else _mem.COMPRESSION_RATIO
             # Measure the current context window size (= full history size).
@@ -873,20 +762,17 @@ class DefaultAgent:
             _current = _mem.count_tokens(self.messages)
             if _current > _budget:
                 # History has grown past the budget — compress it now.
-                # Standalone TR and length-free summary fallbacks share B*r.
-                # Other proportional policies retain their current-size targets.
-                _free_summary = _primitive in ("summarization_free", "structured_summarize_free")
-                if _primitive == "tool_result_clear":
-                    _target = _budget
-                elif _primitive == "truncation" or _free_summary:
+                # Standalone TR and the length-free summary fallback share B*r;
+                # the online primitives' budget-time fallback targets the
+                # current size * depth.
+                _free_summary = _primitive == "summarization_free"
+                if _primitive == "truncation" or _free_summary:
                     _target = max(1, int(_budget * _depth))
                 else:
                     _target = max(1, int(_current * _depth))
                 _evt_before = self._evt_snapshot(self.messages) if self._evt_dir else None
                 _evt_sum_pt0 = self._mem_summarization_prompt_tokens
                 _evt_sum_lat0 = self._mem_summarization_latency_s
-                _trc_fallback = False
-                _trc_stats = {}
                 _evt_picked   = None
                 if hasattr(_mem, "pop_summary_outcome"):
                     _mem.pop_summary_outcome()   # discard anything stale before this event
@@ -897,30 +783,9 @@ class DefaultAgent:
                     import copy as _pc_copy
                     _pc_pre   = _pc_copy.deepcopy(self.messages)  # full context entering compression
                     _pc_fired = True
-                if _primitive == "summarization":
-                    # LLM call produces a structured summary replacing messages[2:].
-                    # Tokens used by that summary call are tracked separately so we
-                    # can distinguish them from the main agent's token usage.
-                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize(
-                        self.messages, self.model, _target
-                    )
-                    self._mem_prompt_tokens              += _pt
-                    self._mem_completion_tokens          += _ct
-                    self._mem_summarization_prompt_tokens += _pt
-                    self._mem_summarization_latency_s    += _sum_lat
-                elif _primitive == "structured_summarize":
-                    # LLM call produces a schema-guided summary (Task / Files Modified /
-                    # Files Examined / Execution Anchors / Current State).
-                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.structured_summarize(
-                        self.messages, self.model, _target
-                    )
-                    self._mem_prompt_tokens               += _pt
-                    self._mem_completion_tokens           += _ct
-                    self._mem_summarization_prompt_tokens += _pt
-                    self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive == "summarization_free":
-                    # SU-free: same as "summarization" but the summarizer gets no word
-                    # target (depth-invariant); _target only sizes the complete-turn TR fallback.
+                if _primitive == "summarization_free":
+                    # SU-free: one summarizer call with no word target (depth-invariant);
+                    # _target only sizes the complete-turn TR fallback.
                     self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_free(
                         self.messages, self.model, _target
                     )
@@ -928,176 +793,11 @@ class DefaultAgent:
                     self._mem_completion_tokens           += _ct
                     self._mem_summarization_prompt_tokens += _pt
                     self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive == "structured_summarize_free":
-                    # SS-free: schema-guided summary with no word target (depth-invariant).
-                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.structured_summarize_free(
-                        self.messages, self.model, _target
-                    )
-                    self._mem_prompt_tokens               += _pt
-                    self._mem_completion_tokens           += _ct
-                    self._mem_summarization_prompt_tokens += _pt
-                    self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive == "summarization_partial":
-                    # SU-partial: summarize the head, keep the budget-fitting tail verbatim.
-                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_partial(
-                        self.messages, self.model, _target
-                    )
-                    self._mem_prompt_tokens               += _pt
-                    self._mem_completion_tokens           += _ct
-                    self._mem_summarization_prompt_tokens += _pt
-                    self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive == "structured_summarize_partial":
-                    # SS-partial: structured-summarize the head, keep budget-fitting tail verbatim.
-                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.structured_summarize_partial(
-                        self.messages, self.model, _target
-                    )
-                    self._mem_prompt_tokens               += _pt
-                    self._mem_completion_tokens           += _ct
-                    self._mem_summarization_prompt_tokens += _pt
-                    self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive == "tool_result_clear":
-                    # Clear ALL results older than the latest three, then drop
-                    # complete oldest turns only until the budget is met.
-                    self.messages, _saved, _trc_fallback = _mem.tool_result_clear(
-                        self.messages, _budget, stats=_trc_stats
-                    )
-                    if _trc_fallback:
-                        self._mem_trc_fallback_events += 1
-                elif _primitive == "scored_tool_result_clear":
-                    # Ranked clearing: stubs out bash output bodies lowest-score first.
-                    # Score = type_weight × size + citation_boost (ACT-R inspired).
-                    # Falls back to truncate() if scored clearing is insufficient.
-                    self.messages, _saved, _trc_fallback = _mem.scored_tool_result_clear(self.messages, _target)
-                    if _trc_fallback:
-                        self._mem_trc_fallback_events += 1
-                elif _primitive == "trc_summarize":
-                    # Stage 1: clear every result older than the newest three;
-                    # the summary stage handles any remaining budget overflow.
-                    self.messages, _saved, _ = _mem.tool_result_clear(
-                        self.messages, _budget, fallback_truncate=False, stats=_trc_stats
-                    )
-                    # Stage 2: if still over budget, summarize the remaining history.
-                    _after_trc = _mem.count_tokens(self.messages)
-                    if _after_trc > _budget:
-                        _target2 = max(1, int(_after_trc * _depth))
-                        self.messages, _saved2, _pt, _ct, _sum_lat = _mem.summarize(
-                            self.messages, self.model, _target2
-                        )
-                        _saved += _saved2
-                        self._mem_prompt_tokens               += _pt
-                        self._mem_completion_tokens           += _ct
-                        self._mem_summarization_prompt_tokens += _pt
-                        self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive == "trc_structured_summarize":
-                    # Stage 1: clear every result older than the newest three;
-                    # the summary stage handles any remaining budget overflow.
-                    self.messages, _saved, _ = _mem.tool_result_clear(
-                        self.messages, _budget, fallback_truncate=False, stats=_trc_stats
-                    )
-                    # Stage 2: if still over budget, structured-summarize the remaining history.
-                    _after_trc = _mem.count_tokens(self.messages)
-                    if _after_trc > _budget:
-                        _target2 = max(1, int(_after_trc * _depth))
-                        self.messages, _saved2, _pt, _ct, _sum_lat = _mem.structured_summarize(
-                            self.messages, self.model, _target2
-                        )
-                        _saved += _saved2
-                        self._mem_prompt_tokens               += _pt
-                        self._mem_completion_tokens           += _ct
-                        self._mem_summarization_prompt_tokens += _pt
-                        self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive == "online_trc":
-                    # OTRC+TR: freeze window already cleared the oldest-outside-window result above;
-                    # truncation fires here as the budget-time fallback.
-                    self.messages, _saved = _mem.truncate(self.messages, _target)
                 elif _primitive in ("online_claude_extract", "online_claude_select"):
                     # online_claude_extract / _select rewrote the history above
                     # (see _online_claude); with a budget set, truncation is
-                    # the budget-time fallback, as for online_trc.
+                    # the budget-time fallback.
                     self.messages, _saved = _mem.truncate(self.messages, _target)
-                elif _primitive == "online_trc_summarize_partial":
-                    # OTRC+SU-partial: freeze window already cleared a result above;
-                    # SU-partial fires as the budget-time fallback (head summarized,
-                    # budget-fitting tail kept verbatim — preserves OTRC's freeze window).
-                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_partial(
-                        self.messages, self.model, _target
-                    )
-                    self._mem_prompt_tokens               += _pt
-                    self._mem_completion_tokens           += _ct
-                    self._mem_summarization_prompt_tokens += _pt
-                    self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive == "online_trc_structured_summarize_partial":
-                    # OTRC+SS-partial: same as OTRC+SU-partial but with structured summary.
-                    self.messages, _saved, _pt, _ct, _sum_lat = _mem.structured_summarize_partial(
-                        self.messages, self.model, _target
-                    )
-                    self._mem_prompt_tokens               += _pt
-                    self._mem_completion_tokens           += _ct
-                    self._mem_summarization_prompt_tokens += _pt
-                    self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive in ("staggered_alternate", "staggered_random"):
-                    # Staggered: at each compression event, pick one of the
-                    # oracle-optimal pair (TR + budget-best). Pair is fixed by budget.
-                    _STAGGERED_PAIRS = {
-                        10000: ("truncation", "trc_structured_summarize"),
-                        15000: ("truncation", "summarization_partial"),
-                        20000: ("truncation", "trc_structured_summarize"),
-                    }
-                    if _budget not in _STAGGERED_PAIRS:
-                        raise RuntimeError(
-                            f"staggered: no pair defined for budget {_budget}; "
-                            f"add an entry in _STAGGERED_PAIRS"
-                        )
-                    _p1, _p2 = _STAGGERED_PAIRS[_budget]
-
-                    _idx = getattr(self, "_staggered_event_idx", 0)
-                    if _primitive == "staggered_alternate":
-                        _picked = _p1 if _idx % 2 == 0 else _p2
-                    else:  # staggered_random
-                        if not hasattr(self, "_staggered_rng"):
-                            import random as _stg_random
-                            self._staggered_rng = _stg_random.Random(
-                                hash(os.environ.get("MSWEA_RUN_KEY", ""))
-                            )
-                        _picked = _p1 if self._staggered_rng.random() < 0.5 else _p2
-
-                    if not hasattr(self, "_staggered_log"):
-                        self._staggered_log = []
-                    self._staggered_log.append(_picked)
-                    _evt_picked = _picked
-
-                    # Dispatch to the picked underlying primitive.
-                    if _picked == "truncation":
-                        self.messages, _saved = _mem.truncate(self.messages, _target)
-                    elif _picked == "summarization_partial":
-                        self.messages, _saved, _pt, _ct, _sum_lat = _mem.summarize_partial(
-                            self.messages, self.model, _target
-                        )
-                        self._mem_prompt_tokens               += _pt
-                        self._mem_completion_tokens           += _ct
-                        self._mem_summarization_prompt_tokens += _pt
-                        self._mem_summarization_latency_s     += _sum_lat
-                    elif _picked == "trc_structured_summarize":
-                        # TRC stage (no truncate fallback).
-                        self.messages, _saved, _ = _mem.tool_result_clear(
-                            self.messages, _budget, fallback_truncate=False, stats=_trc_stats
-                        )
-                        # SS fallback if still over budget.
-                        _after_trc = _mem.count_tokens(self.messages)
-                        if _after_trc > _budget:
-                            _target2 = max(1, int(_after_trc * _depth))
-                            self.messages, _saved2, _pt, _ct, _sum_lat = _mem.structured_summarize(
-                                self.messages, self.model, _target2
-                            )
-                            _saved += _saved2
-                            self._mem_prompt_tokens               += _pt
-                            self._mem_completion_tokens           += _ct
-                            self._mem_summarization_prompt_tokens += _pt
-                            self._mem_summarization_latency_s     += _sum_lat
-                    else:
-                        raise RuntimeError(f"staggered: unknown picked primitive {_picked}")
-
-                    self._staggered_event_idx = _idx + 1
                 elif _primitive == "truncation":
                     self.messages, _saved = _mem.truncate_oldest_turns(self.messages, _target)
                 else:  # legacy default for unrecognized primitive names
@@ -1105,7 +805,7 @@ class DefaultAgent:
                     self.messages, _saved = _mem.truncate(self.messages, _target)
 
                 # Outcome of the summary request made by this event (None when the
-                # primitive did not request one, e.g. TRC stage 1 was sufficient).
+                # primitive did not request one, e.g. truncation).
                 _sum_outcome = _mem.pop_summary_outcome() if hasattr(_mem, "pop_summary_outcome") else None
                 self._mem_active_compression = None
                 if _sum_outcome is not None:
@@ -1123,12 +823,6 @@ class DefaultAgent:
                         # provider response id per attempt: joins summarizer
                         # requests to the server-side KV trace
                         "response_ids": list(_sum_outcome.get("response_ids") or []),
-                    })
-
-                if _trc_stats:
-                    self._mem_trc_events.append({
-                        "step": self.n_calls, "primitive": _primitive,
-                        "picked": _evt_picked, **_trc_stats,
                     })
 
                 _after = _mem.count_tokens(self.messages)
@@ -1155,12 +849,11 @@ class DefaultAgent:
                 if _evt_before is not None:
                     self._evt_record_compression(
                         "budget", _evt_before, primitive=_primitive, picked=_evt_picked,
-                        budget=_budget, target_tokens=_target, trc_fallback=bool(_trc_fallback),
+                        budget=_budget, target_tokens=_target,
                         tokens_saved_reported=_saved,
                         summary_prompt_tokens=self._mem_summarization_prompt_tokens - _evt_sum_pt0,
                         summary_latency_s=self._mem_summarization_latency_s - _evt_sum_lat0,
                         summary_outcome=_sum_outcome,
-                        trc_stats=_trc_stats or None,
                         **({"adaptive_config": _adaptive_config.to_dict()}
                            if _adaptive_config is not None else {}),
                         **({"tr_stats": _tr_stats} if _tr_stats is not None else {}),
@@ -1191,17 +884,6 @@ class DefaultAgent:
                 # current context size directly. If it still exceeds B, another
                 # compression event can fire before the next model call.
         # ────────────────────────────────────────────────────────────────────
-
-        if self._clm is not None and self._clm.before_call(self) == "stop":
-            # The final turn at the context limit has been taken and the context
-            # is still over it: end the run (nothing was submitted).
-            raise LimitsExceeded(
-                {
-                    "role": "exit",
-                    "content": "ContextBudgetExceeded",
-                    "extra": {"exit_status": "ContextBudgetExceeded", "submission": ""},
-                }
-            )
 
         self._advance_memory_policy(_adaptive_config, _adaptive_events)
         self.n_calls += 1
@@ -1245,8 +927,6 @@ class DefaultAgent:
         self._mem_call_latencies.append(_latency)
         self._mem_step_prompt_tokens.append(_step_pt)
         self._mem_step_completion_tokens.append(_step_ct)
-        if self._clm is not None:
-            self._clm.after_call(_step_pt)
         _call_status = (
             "ok" if _query_error is None
             else "format_error" if isinstance(_query_error, FormatError) else "error"
@@ -1294,7 +974,6 @@ class DefaultAgent:
 
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
-        self._clm_before_actions(message)
         outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
         observations = self.add_messages(*self._observation_messages(message, outputs))
         self._output_extract(message, observations)
@@ -1420,19 +1099,9 @@ class DefaultAgent:
             if self.config.output_path:
                 self.save(self.config.output_path)
 
-    def _clm_before_actions(self, message: dict) -> None:
-        """clm: mirror the context into the task container before the action runs."""
-        if self._clm is not None:
-            self._clm.before_actions(self, message)
-
     def _observation_messages(self, message: dict, outputs: list[dict]) -> list[dict]:
-        """Observation messages for the executed actions. Under clm the context
-        mirror is read back first: an edit replaces self.messages, and the edit
-        note and context readout are appended to the observation."""
-        observations = self.model.format_observation_messages(message, outputs, self.get_template_vars())
-        if self._clm is not None and outputs:
-            observations = self._clm.after_actions(self, message, outputs, observations)
-        return observations
+        """Observation messages for the executed actions."""
+        return self.model.format_observation_messages(message, outputs, self.get_template_vars())
 
     def serialize(self, *extra_dicts) -> dict:
         """Serialize agent state to a json-compatible nested dictionary for saving."""
@@ -1451,7 +1120,6 @@ class DefaultAgent:
                 "mini_version": __version__,
                 "exit_status": last_extra.get("exit_status", ""),
                 "submission": last_extra.get("submission", ""),
-                "staggered_log": getattr(self, "_staggered_log", []),
             },
             "messages": self.messages,
             "trajectory_format": "mini-swe-agent-1.1",
