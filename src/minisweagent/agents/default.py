@@ -114,9 +114,12 @@ class DefaultAgent:
         self._evt_seq  = 0   # shared ordering counter for messages and compression events
         self._evt_n_compression = 0
 
-    # per-step (online) compression kinds; a query with one of these advances
-    # the online interval clock of the adaptive policy
-    _ONLINE_EVENT_KINDS = ("online_claude_select",)
+    # per-step (online) primitives; a query with one of these advances the
+    # online interval clock of the adaptive policy. Both are logged under the
+    # event kind "online_claude_select" (the anchored form is the same
+    # selector with anchor tags and a cap; its records carry "anchor" / "cap").
+    _ONLINE_PRIMITIVES = ("online_claude_select", "online_claude_select_anchored")
+    _ONLINE_EVENT_KINDS = _ONLINE_PRIMITIVES
 
     def _advance_memory_policy(self, config, events):
         """Notify after an event; selected settings take effect on the next query.
@@ -358,14 +361,17 @@ class DefaultAgent:
         self._mem_summary_outcomes.append(entry)
         return entry
 
-    def _online_claude_select(self) -> dict | None:
-        """Run memory.online_claude_select() and record it.
+    def _online_claude_select(self, primitive: str = "online_claude_select") -> dict | None:
+        """Run memory.online_claude_select() / online_claude_select_anchored() and record it.
 
         Claude picks messages / output lines from the complete history
         (self._full_messages) and the context is rebuilt from the original
         text. MSWEA_EXTRACT_KEEP_RECENT (default 1: the newest turn stays
         verbatim); the selector model settings are MSWEA_EXTRACT_MODEL /
-        _EFFORT / ... (claude_extract.py).
+        _EFFORT / ... (claude_extract.py). ``primitive``
+        "online_claude_select_anchored" calls the anchored, capped form
+        (cap = memory.SELECT_CAP_DEFAULT unless MSWEA_SELECT_CAP is set); the
+        event kind and the log fields stay "online_claude_select" for both.
 
         Returns the per-attempt record appended to
         _mem_online_claude_select_events, or None when there was nothing to
@@ -383,7 +389,9 @@ class DefaultAgent:
         turn the condition into full context.
         """
         import memory as _mem
-        _primitive = "online_claude_select"
+        if primitive not in self._ONLINE_PRIMITIVES:
+            raise ValueError(f"primitive must be one of {self._ONLINE_PRIMITIVES}, got {primitive!r}")
+        _primitive = "online_claude_select"   # the log kind, for both primitives
         _events    = self._mem_online_claude_select_events
         _errors_attr = "_mem_online_claude_select_consecutive_errors"
         _saved_attr  = "_mem_online_claude_select_tokens_saved"
@@ -407,9 +415,16 @@ class DefaultAgent:
         _event["tokens_full"] = _mem.count_tokens(self._full_messages)
         _t0 = time.time()
         try:
-            self.messages, _saved, _pt, _ct, _lat = _mem.online_claude_select(
-                _source, self.messages, self.model, keep_recent=_keep
-            )
+            if primitive == "online_claude_select_anchored":
+                _cap = _mem.select_cap_override()
+                self.messages, _saved, _pt, _ct, _lat = _mem.online_claude_select_anchored(
+                    _source, self.messages, self.model, keep_recent=_keep,
+                    **({} if _cap is None else {"cap": _cap})
+                )
+            else:
+                self.messages, _saved, _pt, _ct, _lat = _mem.online_claude_select(
+                    _source, self.messages, self.model, keep_recent=_keep
+                )
         except Exception as exc:   # noqa: BLE001 - recorded, re-raised past the error cap
             _event["error"]     = f"{type(exc).__name__}: {exc}"
             _event["latency_s"] = round(time.time() - _t0, 3)
@@ -485,7 +500,7 @@ class DefaultAgent:
         ---------------------
         Reads two environment variables before every LLM call:
           MSWEA_PRIMITIVE    : "truncation" | "summarization_free" (no length target)
-                               | "online_claude_select"
+                               | "online_claude_select" | "online_claude_select_anchored"
           MSWEA_TOKEN_BUDGET : int  — fires when estimated prompt tokens exceed this
 
         Budget-triggered primitives target budget * COMPRESSION_RATIO. System
@@ -572,9 +587,11 @@ class DefaultAgent:
         # (+ MSWEA_EXTRACT_KEEP_RECENT newest messages verbatim). Cadence: the
         # adaptive step_interval when a policy is active, else every
         # MSWEA_EXTRACT_EVERY calls (default 1). The first call has nothing to
-        # select yet. (The extract sibling and the threshold / output-extract /
-        # phase-gate variants were removed 2026-11-19.)
-        if _primitive == "online_claude_select" and self.n_calls > 0:
+        # select yet. online_claude_select_anchored is the same hook with the
+        # anchored, capped selector (cell ocsa). (The extract sibling and the
+        # threshold / output-extract / phase-gate variants were removed
+        # 2026-11-19.)
+        if _primitive in self._ONLINE_PRIMITIVES and self.n_calls > 0:
             if _adaptive_config is not None:
                 _ex_due = _online_due
             else:
@@ -584,7 +601,7 @@ class DefaultAgent:
                 if _pc_dir and _pc_pre is None:
                     import copy as _pc_copy_ex
                     _pc_pre = _pc_copy_ex.deepcopy(self.messages)
-                _ex_rec = self._online_claude_select()
+                _ex_rec = self._online_claude_select(_primitive)
                 if _ex_rec is not None:
                     _pc_fired = _pc_fired or bool(_ex_rec.get("accepted"))
                     if _adaptive_config is not None:
@@ -636,8 +653,8 @@ class DefaultAgent:
                     self._mem_completion_tokens           += _ct
                     self._mem_summarization_prompt_tokens += _pt
                     self._mem_summarization_latency_s     += _sum_lat
-                elif _primitive == "online_claude_select":
-                    # online_claude_select rebuilt the history above (see
+                elif _primitive in self._ONLINE_PRIMITIVES:
+                    # online_claude_select(_anchored) rebuilt the history above (see
                     # _online_claude_select); with a budget set, truncation is
                     # the budget-time fallback.
                     self.messages, _saved = _mem.truncate(self.messages, _target)
